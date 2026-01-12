@@ -243,7 +243,8 @@ USER_SEMANTIC_CACHE_DIR = "/workspace/cache/embeddings"
 # 값 검증 설정 (v2에서 추가)
 # =============================================================================
 ENABLE_VALUE_VALIDATION = True
-NUMERIC_VARIANCE_THRESHOLD = 0.5  # 과거 값 대비 50% 이내 허용
+# NUMERIC_VARIANCE_THRESHOLD 제거: 실제 사양값은 과거 값과 전혀 다를 수 있으므로
+# 과거 값 대비 variance check는 부적절함 (v53에서 제거)
 MIN_VALUE_LENGTH = 1
 MAX_VALUE_LENGTH = 200
 
@@ -294,7 +295,7 @@ OUTPUT_SCHEMA_COLUMNS = [
     "file_name",
     # 추출 결과 컬럼
     "section_num", "table_text", "value_format",
-    "pos_extwg_desc", "pos_umgv_desc",
+    "pos_mat_attr_desc", "pos_umgv_desc",
     "pos_umgv_value", "umgv_value_edit", "pos_umgv_uom",
     "pos_chunk",
     "evidence_fb",  # 빈값 고정
@@ -930,7 +931,7 @@ class Config:
 
     # 값 검증 설정 (v2에서 추가)
     enable_value_validation: bool = True
-    numeric_variance_threshold: float = 0.5
+    # numeric_variance_threshold 제거 (v53) - 과거 값 대비 variance check는 부적절
     min_value_length: int = 1
     max_value_length: int = 200
 
@@ -1034,7 +1035,7 @@ def build_config() -> Config:
 
         # 값 검증 설정 (v2에서 추가)
         enable_value_validation=ENABLE_VALUE_VALIDATION,
-        numeric_variance_threshold=NUMERIC_VARIANCE_THRESHOLD,
+        # numeric_variance_threshold 제거 (v53)
         min_value_length=MIN_VALUE_LENGTH,
         max_value_length=MAX_VALUE_LENGTH,
 
@@ -1090,6 +1091,10 @@ class ExtractionResult:
     validation_status: str = ""  # v2에서 추가: "valid", "invalid", "warning", ""
     validation_message: str = ""  # v2에서 추가
     compound_values: List[Tuple[str, str]] = field(default_factory=list)  # v2에서 추가
+    # v53에서 추가: POS 원문 텍스트 보존
+    original_spec_name: str = ""  # POS에 적힌 그대로의 사양명 (소문자, 특수문자 등 보존)
+    original_unit: str = ""  # POS에 적힌 그대로의 단위
+    original_equipment: str = ""  # POS에 적힌 그대로의 장비명
 
 
 # ############################################################################
@@ -6035,12 +6040,19 @@ class LLMFallbackExtractor:
 ## 출력 형식 (JSON)
 정확히 다음 형식으로만 응답하세요:
 ```json
-{{"value": "추출된값", "unit": "단위", "confidence": 0.0~1.0}}
+{{
+  "value": "추출된값",
+  "unit": "단위",
+  "confidence": 0.0~1.0,
+  "original_spec_name": "POS에 적힌 사양명 그대로",
+  "original_unit": "POS에 적힌 단위 그대로",
+  "original_equipment": "POS에 적힌 장비명 그대로"
+}}
 ```
 
 값을 찾지 못한 경우:
 ```json
-{{"value": "", "unit": "", "confidence": 0.0}}
+{{"value": "", "unit": "", "confidence": 0.0, "original_spec_name": "", "original_unit": "", "original_equipment": ""}}
 ```
 
 주의사항:
@@ -6049,6 +6061,9 @@ class LLMFallbackExtractor:
 3. 여러 값이 있으면 가장 관련성 높은 것을 선택하세요
 4. 확실하지 않으면 confidence를 낮게 설정하세요
 5. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
+6. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
+   - 대소문자, 띄어쓰기, 특수문자 등을 정확히 보존하세요
+   - 예: POS에 "capacity"로 적혀있으면 "capacity", "CAPACITY"로 적혀있으면 "CAPACITY"
 """
         return prompt
     
@@ -6094,8 +6109,8 @@ class LLMFallbackExtractor:
             return None
     
     def _parse_llm_response(
-        self, 
-        response: str, 
+        self,
+        response: str,
         spec: SpecItem,
         chunk: str
     ) -> Optional[ExtractionResult]:
@@ -6105,25 +6120,33 @@ class LLMFallbackExtractor:
             json_match = re.search(r'\{[^{}]+\}', response)
             if not json_match:
                 return None
-            
+
             data = json.loads(json_match.group())
-            
+
             value = data.get("value", "").strip()
             unit = data.get("unit", "").strip()
             confidence = float(data.get("confidence", 0.0))
-            
+
+            # v53: POS 원문 텍스트 추출
+            original_spec_name = data.get("original_spec_name", "").strip()
+            original_unit = data.get("original_unit", "").strip()
+            original_equipment = data.get("original_equipment", "").strip()
+
             if not value:
                 return None
-            
+
             return ExtractionResult(
                 spec_item=spec,
                 value=value,
                 unit=unit or spec.expected_unit,
                 chunk=chunk[:500],
                 method="LLM_FALLBACK",
-                confidence=confidence * 0.9  # LLM 결과는 약간 낮은 신뢰도
+                confidence=confidence * 0.9,  # LLM 결과는 약간 낮은 신뢰도
+                original_spec_name=original_spec_name,
+                original_unit=original_unit,
+                original_equipment=original_equipment
             )
-            
+
         except json.JSONDecodeError:
             self.log.warning("LLM 응답 JSON 파싱 실패")
             return None
@@ -6654,11 +6677,12 @@ class POSExtractorV52:
             'value_format': self._detect_format(result.value),
             'umgv_uom': spec.expected_unit,
             'pos_chunk': result.chunk[:500] if result.chunk else '',
-            'pos_extwg_desc': spec.equipment,
-            'pos_umgv_desc': spec.spec_name,
+            # v53: POS 원문 텍스트 보존 (대소문자, 특수문자 등 그대로)
+            'pos_mat_attr_desc': result.original_equipment or spec.equipment,
+            'pos_umgv_desc': result.original_spec_name or spec.spec_name,
             'pos_umgv_value': result.value,
-            'umgv_value_edit': result.value,
-            'pos_umgv_uom': result.unit,
+            'umgv_value_edit': '',  # Always empty - user feedback before validation
+            'pos_umgv_uom': result.original_unit or result.unit,
             'evidence_fb': '',
             # Additional metadata fields (not in required spec but useful)
             'file_name': os.path.basename(html_path) if html_path else '',
@@ -6689,7 +6713,7 @@ class POSExtractorV52:
             'value_format': '',
             'umgv_uom': spec.expected_unit,
             'pos_chunk': '',
-            'pos_extwg_desc': '',
+            'pos_mat_attr_desc': '',
             'pos_umgv_desc': '',
             'pos_umgv_value': '',
             'umgv_value_edit': '',
@@ -7039,7 +7063,7 @@ class POSExtractorV52:
             query = f"""
                 SELECT
                     umgv_desc, umgv_code, umgv_value, umgv_uom,
-                    pos_extwg_desc, pos_umgv_desc,
+                    pos_mat_attr_desc, pos_umgv_desc,
                     matnr, doknr
                 FROM {VERIFY_MODE_SPECDB_TABLE}
                 WHERE matnr LIKE %s
@@ -7080,7 +7104,7 @@ class POSExtractorV52:
         spec = SpecItem(
             spec_name=umgv_desc,
             spec_code=db_item.get('umgv_code', ''),
-            equipment=db_item.get('pos_extwg_desc', ''),
+            equipment=db_item.get('pos_mat_attr_desc', ''),
             expected_unit=db_unit,
             matnr=db_item.get('matnr', ''),
             hull=self._extract_hull_from_filename(os.path.basename(html_file)),
@@ -7209,7 +7233,7 @@ class POSExtractorV52:
                 spec = SpecItem(
                     spec_name=row.get('umgv_desc', ''),
                     spec_code=row.get('umgv_code', ''),
-                    equipment=row.get('pos_extwg_desc', ''),
+                    equipment=row.get('pos_mat_attr_desc', ''),
                     expected_unit=row.get('umgv_uom', ''),
                     matnr=row.get('matnr', ''),
                     hull=hull,
