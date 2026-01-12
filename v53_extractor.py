@@ -224,6 +224,29 @@ USER_SEMANTIC_TOP_K = 5
 USER_ENABLE_LLM_SIMILARITY_VALIDATION = False
 USER_SEMANTIC_CACHE_DIR = "/workspace/cache/embeddings"
 
+# =============================================================================
+# 값 검증 설정 (v2에서 추가)
+# =============================================================================
+ENABLE_VALUE_VALIDATION = True
+NUMERIC_VARIANCE_THRESHOLD = 0.5  # 과거 값 대비 50% 이내 허용
+MIN_VALUE_LENGTH = 1
+MAX_VALUE_LENGTH = 200
+
+# =============================================================================
+# 복합값/범위값 파싱 설정 (v2에서 추가)
+# =============================================================================
+SPLIT_COMPOUND_VALUES = True  # 슬래시(/) 구분 복합값 분리 여부
+SPLIT_RANGE_VALUES = True     # 범위(~, -) 값 분리 여부
+
+# =============================================================================
+# Claude API 설정 (v2에서 추가)
+# =============================================================================
+USE_CLAUDE_API = False  # Claude API 사용 여부 (기본은 Ollama)
+CLAUDE_API_KEY = ""     # Claude API 키
+CLAUDE_MODEL = "claude-3-5-sonnet-20241022"  # Claude 모델명
+CLAUDE_MAX_TOKENS = 4096
+CLAUDE_TEMPERATURE = 0.0
+
 
 # =============================================================================
 # 로깅 설정
@@ -234,6 +257,21 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("POSExtractorV52")
+
+
+# ############################################################################
+# 체크박스 패턴 (하드코딩 허용 - 표준화된 UI 패턴) (v2에서 추가)
+# ############################################################################
+
+CHECKBOX_PATTERNS = {
+    'YNQ_BRACKET': re.compile(r'\(([YNQ])\)', re.IGNORECASE),
+    'CHECKED_SQUARE': re.compile(r'\[x\]|\[X\]|■|☑|✓|✔|√'),
+    'UNCHECKED_SQUARE': re.compile(r'\[\s*\]|□|☐'),
+    'CHECKED_CIRCLE': re.compile(r'●|◉'),
+    'UNCHECKED_CIRCLE': re.compile(r'○|◯'),
+    'OX_CHECKED': re.compile(r'\(O\)|\(o\)'),
+    'OX_UNCHECKED': re.compile(r'\(X\)|\(x\)'),
+}
 
 
 # =============================================================================
@@ -299,6 +337,145 @@ def safe_get(data: Dict, key: str, default: str = "") -> str:
         return default
     val = data.get(key, default)
     return norm(val) if val is not None else default
+
+
+def safe_float(val: Any, default: float = 0.0) -> float:
+    """안전한 float 변환 (v2에서 추가)"""
+    try:
+        if val is None:
+            return default
+        if isinstance(val, str):
+            val = val.replace(',', '').strip()
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def extract_numeric_value(text: str) -> Optional[float]:
+    """텍스트에서 숫자값 추출 (v2에서 추가)"""
+    if not text:
+        return None
+    # 숫자와 소수점, 쉼표만 추출
+    nums = re.findall(r'[\d,]+\.?\d*', text)
+    if nums:
+        try:
+            return float(nums[0].replace(',', ''))
+        except ValueError:
+            return None
+    return None
+
+
+def is_numeric_spec(spec_name: str, value_format: str = "") -> bool:
+    """숫자형 사양인지 판단 (v2에서 추가)"""
+    numeric_keywords = [
+        'capacity', 'head', 'power', 'pressure', 'temperature',
+        'flow', 'speed', 'rpm', 'voltage', 'frequency', 'weight',
+        'qty', 'quantity', 'no.', 'number', 'length', 'width', 'height',
+        'diameter', 'thickness', 'volume', 'area', 'mcr', 'ncr'
+    ]
+    spec_lower = spec_name.lower()
+    return any(kw in spec_lower for kw in numeric_keywords)
+
+
+def detect_checkbox_selection(text: str) -> Optional[str]:
+    """체크박스 선택 상태 감지 (v2에서 추가)"""
+    if not text:
+        return None
+
+    ynq_match = CHECKBOX_PATTERNS['YNQ_BRACKET'].search(text)
+    if ynq_match:
+        return ynq_match.group(1).upper()
+
+    if CHECKBOX_PATTERNS['CHECKED_SQUARE'].search(text):
+        return "Y"
+    if CHECKBOX_PATTERNS['CHECKED_CIRCLE'].search(text):
+        return "Y"
+    if CHECKBOX_PATTERNS['OX_CHECKED'].search(text):
+        return "Y"
+
+    if CHECKBOX_PATTERNS['UNCHECKED_SQUARE'].search(text):
+        return "N"
+    if CHECKBOX_PATTERNS['UNCHECKED_CIRCLE'].search(text):
+        return "N"
+    if CHECKBOX_PATTERNS['OX_UNCHECKED'].search(text):
+        return "N"
+
+    return None
+
+
+def parse_compound_value(raw_value: str, split_enabled: bool = True) -> List[Tuple[str, str]]:
+    """복합값 파싱 - 슬래시 구분 (v2에서 추가)"""
+    if not raw_value or not raw_value.strip():
+        return []
+
+    raw_value = raw_value.strip()
+
+    if not split_enabled:
+        return [(raw_value, "")]
+
+    # 단위 보호 패턴
+    protected_units = ['m3/h', 'kg/h', 'l/h', 'nm3/h', 'kj/kg', 'w/m2', 'kg/m3', 'l/min', 'kg/cm2']
+    temp_value = raw_value
+    placeholders = {}
+
+    for i, unit in enumerate(protected_units):
+        placeholder = f"__UNIT_{i}__"
+        if unit.lower() in temp_value.lower():
+            temp_value = re.sub(re.escape(unit), placeholder, temp_value, flags=re.IGNORECASE)
+            placeholders[placeholder] = unit
+
+    # 슬래시로 분리 (보호된 단위 제외)
+    parts = re.split(r'\s*/\s*', temp_value)
+
+    if len(parts) == 1:
+        return [(raw_value, "")]
+
+    results = []
+    for part in parts:
+        part = part.strip()
+        # 플레이스홀더 복원
+        for ph, unit in placeholders.items():
+            part = part.replace(ph, unit)
+
+        if not part:
+            continue
+
+        # 숫자와 단위 분리
+        match = re.match(r'^([0-9,.\-\s]+)\s*([a-zA-Z°℃%/\d]+.*)?$', part)
+        if match:
+            val = match.group(1).strip()
+            unit = match.group(2).strip() if match.group(2) else ""
+            results.append((val, unit))
+        else:
+            results.append((part, ""))
+
+    return results if results else [(raw_value, "")]
+
+
+def parse_range_value(raw_value: str, split_enabled: bool = True) -> List[Tuple[str, str]]:
+    """범위형 값 파싱 (v2에서 추가)"""
+    if not raw_value or not raw_value.strip():
+        return []
+
+    raw_value = raw_value.strip()
+
+    if not split_enabled:
+        unit_match = re.search(r'([a-zA-Z°℃%/]+)\s*$', raw_value)
+        unit = unit_match.group(1) if unit_match else ""
+        return [(raw_value, unit)]
+
+    range_match = re.match(r'^([0-9,.\s]+)\s*[~\-]\s*([0-9,.\s]+)\s*([a-zA-Z°℃%]+)?$', raw_value)
+
+    if range_match:
+        val1 = range_match.group(1).strip()
+        val2 = range_match.group(2).strip()
+        unit = range_match.group(3) or ""
+        return [(val1, unit), (val2, unit)]
+
+    # 범위가 아니면 단일 값
+    unit_match = re.search(r'([a-zA-Z°℃%/]+)\s*$', raw_value)
+    unit = unit_match.group(1) if unit_match else ""
+    return [(raw_value, unit)]
 
 
 def build_composite_text(*texts) -> str:
@@ -512,6 +689,23 @@ class Config:
     light_mode_batch_disabled: bool = True
     light_mode_skip_hybrid_match: bool = True
 
+    # 값 검증 설정 (v2에서 추가)
+    enable_value_validation: bool = True
+    numeric_variance_threshold: float = 0.5
+    min_value_length: int = 1
+    max_value_length: int = 200
+
+    # 복합값/범위값 파싱 (v2에서 추가)
+    split_compound_values: bool = True
+    split_range_values: bool = True
+
+    # Claude API 설정 (v2에서 추가)
+    use_claude_api: bool = False
+    claude_api_key: str = ""
+    claude_model: str = "claude-3-5-sonnet-20241022"
+    claude_max_tokens: int = 4096
+    claude_temperature: float = 0.0
+
 
 def build_config() -> Config:
     """사용자 설정을 Config 객체로 변환"""
@@ -595,6 +789,23 @@ def build_config() -> Config:
         # Light 모드 최적화
         light_mode_batch_disabled=LIGHT_MODE_BATCH_DISABLED,
         light_mode_skip_hybrid_match=LIGHT_MODE_SKIP_HYBRID_MATCH,
+
+        # 값 검증 설정 (v2에서 추가)
+        enable_value_validation=ENABLE_VALUE_VALIDATION,
+        numeric_variance_threshold=NUMERIC_VARIANCE_THRESHOLD,
+        min_value_length=MIN_VALUE_LENGTH,
+        max_value_length=MAX_VALUE_LENGTH,
+
+        # 복합값/범위값 파싱 (v2에서 추가)
+        split_compound_values=SPLIT_COMPOUND_VALUES,
+        split_range_values=SPLIT_RANGE_VALUES,
+
+        # Claude API 설정 (v2에서 추가)
+        use_claude_api=USE_CLAUDE_API,
+        claude_api_key=CLAUDE_API_KEY,
+        claude_model=CLAUDE_MODEL,
+        claude_max_tokens=CLAUDE_MAX_TOKENS,
+        claude_temperature=CLAUDE_TEMPERATURE,
     )
 
 
@@ -640,6 +851,264 @@ class ExtractionResult:
     errors: List[str] = field(default_factory=list)
     similarity_info: Dict = field(default_factory=dict)
     reference_source: str = ""
+    found: bool = True  # v2에서 추가
+    validation_status: str = ""  # v2에서 추가: "valid", "invalid", "warning", ""
+    validation_message: str = ""  # v2에서 추가
+    compound_values: List[Tuple[str, str]] = field(default_factory=list)  # v2에서 추가
+
+
+# ############################################################################
+# 동의어 관리자 (DB 기반 - 하드코딩 제거) (v2에서 추가)
+# ############################################################################
+
+class SynonymManager:
+    """
+    DB 기반 동의어 관리자
+    - pos_dict의 umgv_desc(표준명) ↔ pos_umgv_desc(유의어) 매핑
+    - 하드코딩 동의어 제거
+    """
+
+    def __init__(self):
+        self.logger = logging.getLogger("SynonymManager")
+
+        # 표준명 → 유의어 목록
+        self.std_to_synonyms: Dict[str, Set[str]] = defaultdict(set)
+
+        # 유의어 → 표준명 역매핑
+        self.synonym_to_std: Dict[str, str] = {}
+
+        # umgv_code → 모든 관련 용어
+        self.code_to_terms: Dict[str, Set[str]] = defaultdict(set)
+
+    def build_from_glossary(self, df_glossary: pd.DataFrame):
+        """용어집에서 동의어 매핑 구축"""
+        self.std_to_synonyms.clear()
+        self.synonym_to_std.clear()
+        self.code_to_terms.clear()
+
+        if df_glossary.empty:
+            self.logger.warning("빈 용어집으로 동의어 매핑 구축 불가")
+            return
+
+        # 필요한 컬럼 확인
+        required_cols = ['umgv_desc', 'pos_umgv_desc']
+        for col in required_cols:
+            if col not in df_glossary.columns:
+                self.logger.warning(f"용어집에 {col} 컬럼 없음")
+                return
+
+        for _, row in df_glossary.iterrows():
+            std_name = norm(row.get('umgv_desc', ''))
+            pos_name = norm(row.get('pos_umgv_desc', ''))
+            umgv_code = norm(row.get('umgv_code', ''))
+
+            if not std_name:
+                continue
+
+            std_upper = std_name.upper()
+
+            # 표준명 자체도 검색어로 등록
+            self.std_to_synonyms[std_upper].add(std_name)
+            self.code_to_terms[umgv_code].add(std_name)
+
+            # 유의어 등록
+            if pos_name and pos_name != std_name:
+                pos_upper = pos_name.upper()
+
+                # 표준명 → 유의어
+                self.std_to_synonyms[std_upper].add(pos_name)
+
+                # 유의어 → 표준명
+                self.synonym_to_std[pos_upper] = std_name
+
+                # 코드 → 용어
+                self.code_to_terms[umgv_code].add(pos_name)
+
+        total_mappings = sum(len(v) for v in self.std_to_synonyms.values())
+        self.logger.info(f"동의어 매핑 구축: {len(self.std_to_synonyms)}개 표준명, {total_mappings}개 총 매핑")
+
+    def get_synonyms(self, term: str) -> List[str]:
+        """용어의 동의어 목록 반환"""
+        if not term:
+            return []
+
+        term_upper = term.upper().strip()
+        synonyms = set()
+
+        # 1. 표준명으로 검색
+        if term_upper in self.std_to_synonyms:
+            synonyms.update(self.std_to_synonyms[term_upper])
+
+        # 2. 유의어로 검색 (역매핑)
+        if term_upper in self.synonym_to_std:
+            std_name = self.synonym_to_std[term_upper]
+            synonyms.update(self.std_to_synonyms.get(std_name.upper(), set()))
+
+        # 3. 부분 매칭 (표준명에 포함된 경우)
+        for std, syns in self.std_to_synonyms.items():
+            if term_upper in std or std in term_upper:
+                synonyms.update(syns)
+
+        # 원본 제외하고 반환
+        synonyms.discard(term)
+        return list(synonyms)
+
+    def get_all_search_terms(self, term: str, umgv_code: str = "") -> List[str]:
+        """검색에 사용할 모든 용어 반환 (우선순위순)"""
+        terms = []
+        term_upper = term.upper().strip() if term else ""
+
+        # 1순위: 원본 용어
+        if term:
+            terms.append(term)
+
+        # 2순위: umgv_code로 연결된 모든 용어
+        if umgv_code and umgv_code in self.code_to_terms:
+            for t in self.code_to_terms[umgv_code]:
+                if t not in terms:
+                    terms.append(t)
+
+        # 3순위: 동의어
+        synonyms = self.get_synonyms(term)
+        for syn in synonyms:
+            if syn not in terms:
+                terms.append(syn)
+
+        # 4순위: 토큰화된 부분 (3글자 이상)
+        if term:
+            parts = re.split(r'[_\s\-/()]+', term)
+            for p in parts:
+                if len(p) >= 3 and p not in terms:
+                    terms.append(p)
+
+        # 중복 제거 및 길이순 정렬 (긴 것이 더 구체적)
+        seen = set()
+        unique = []
+        for t in terms:
+            t_lower = t.lower()
+            if t_lower not in seen:
+                seen.add(t_lower)
+                unique.append(t)
+
+        unique.sort(key=len, reverse=True)
+        return unique[:20]  # 최대 20개
+
+
+# ############################################################################
+# 값 검증기 (Phase 4) (v2에서 추가)
+# ############################################################################
+
+class ValueValidator:
+    """
+    추출된 값 검증 (Phase 4)
+    - 숫자형 사양 검증
+    - 단위 비교
+    - 과거 값 범위 검증
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger("ValueValidator")
+
+    def validate(self, result: ExtractionResult, spec: SpecItem,
+                 historical_values: List[float] = None) -> ExtractionResult:
+        """추출 결과 검증"""
+        if not self.config.enable_value_validation:
+            return result
+
+        if not result.found or not result.value:
+            return result
+
+        validation_issues = []
+
+        # 1. 길이 검증
+        if len(result.value) < self.config.min_value_length:
+            validation_issues.append("값이 너무 짧음")
+        if len(result.value) > self.config.max_value_length:
+            validation_issues.append("값이 너무 김")
+            result.confidence *= 0.5
+
+        # 2. 숫자형 사양 검증
+        if is_numeric_spec(spec.spec_name):
+            numeric_val = extract_numeric_value(result.value)
+
+            if numeric_val is None:
+                # 숫자형인데 숫자가 없음 → 잘못된 추출 가능성
+                validation_issues.append("숫자형 사양이나 숫자 없음")
+                result.confidence *= 0.6
+            elif historical_values:
+                # 과거 값과 비교
+                avg_historical = sum(historical_values) / len(historical_values)
+                if avg_historical > 0:
+                    variance = abs(numeric_val - avg_historical) / avg_historical
+                    if variance > self.config.numeric_variance_threshold:
+                        validation_issues.append(f"과거 값({avg_historical:.1f})과 차이 큼({variance:.1%})")
+                        result.confidence *= 0.7
+
+        # 3. 단위 검증
+        if spec.expected_unit and result.unit:
+            if not self._units_compatible(spec.expected_unit, result.unit):
+                validation_issues.append(f"단위 불일치: 기대={spec.expected_unit}, 추출={result.unit}")
+                result.confidence *= 0.8
+
+        # 4. 값이 키워드 자체인지 확인 (잘못된 추출)
+        if self._is_likely_keyword(result.value, spec):
+            validation_issues.append("추출된 값이 키워드일 가능성")
+            result.confidence *= 0.4
+
+        # 결과 업데이트
+        if validation_issues:
+            result.validation_status = "warning" if result.confidence > 0.5 else "invalid"
+            result.validation_message = "; ".join(validation_issues)
+        else:
+            result.validation_status = "valid"
+
+        return result
+
+    def _units_compatible(self, expected: str, actual: str) -> bool:
+        """단위 호환성 검사"""
+        if not expected or not actual:
+            return True
+
+        expected_norm = expected.lower().replace(' ', '').replace('.', '')
+        actual_norm = actual.lower().replace(' ', '').replace('.', '')
+
+        # 정확히 일치
+        if expected_norm == actual_norm:
+            return True
+
+        # 포함 관계
+        if expected_norm in actual_norm or actual_norm in expected_norm:
+            return True
+
+        # 동등한 단위 (DB에서 로드하는 것이 이상적이나, 기본적인 것만)
+        unit_equivalents = {
+            ('m3/h', 'm³/h'), ('m3', 'm³'), ('℃', '°c', 'degc'),
+            ('kw', 'kilowatt'), ('rpm', 'r/min', 'rev/min'),
+            ('bar', 'barg', 'bara'), ('mm', 'millimeter'),
+        }
+
+        for equiv_group in unit_equivalents:
+            if expected_norm in equiv_group and actual_norm in equiv_group:
+                return True
+
+        return False
+
+    def _is_likely_keyword(self, value: str, spec: SpecItem) -> bool:
+        """추출된 값이 키워드(사양명)일 가능성 체크"""
+        value_upper = value.upper().strip()
+
+        # 사양명과 유사
+        if value_upper == spec.spec_name.upper():
+            return True
+
+        # 일반적인 헤더 키워드
+        header_keywords = ['type', 'qty', "q'ty", 'remark', 'unit', 'item', 'description',
+                          'spec', 'specification', 'parameter', 'value', 'no.', 'no']
+        if value_upper in [kw.upper() for kw in header_keywords]:
+            return True
+
+        return False
 
 
 # =============================================================================
@@ -3637,7 +4106,11 @@ class POSExtractorV52:
         # 공통 컴포넌트
         self.pre_checker = ImprovedPreChecker()
         self.rule_extractor = RuleBasedExtractor(self.glossary, self.specdb)
-        
+
+        # ValueValidator 초기화 (v2에서 추가)
+        self.value_validator = ValueValidator(self.config)
+        self.log.info("ValueValidator 초기화 완료")
+
         # LLM Fallback 초기화
         self.llm_fallback = None
         if self.config.use_llm and self.config.enable_llm_fallback:
@@ -3708,6 +4181,18 @@ class POSExtractorV52:
             spath = specdb_path or self.config.specdb_path
             self.specdb = LightweightSpecDBIndex(file_path=spath) if spath and os.path.exists(spath) else None
         
+        # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
+        self.synonym_manager = SynonymManager()
+        if self.glossary and hasattr(self.glossary, 'df') and not self.glossary.df.empty:
+            self.synonym_manager.build_from_glossary(self.glossary.df)
+            self.log.info("SynonymManager 초기화 완료")
+        elif self.config.data_source_mode == "db" and self.pg_loader:
+            # DB 모드에서 용어집 다시 로드하여 SynonymManager 구축
+            glossary_df = self.pg_loader.load_glossary_from_db()
+            if not glossary_df.empty:
+                self.synonym_manager.build_from_glossary(glossary_df)
+                self.log.info("SynonymManager 초기화 완료 (DB)")
+
         # ReferenceHintEngine 초기화 (용어집/사양값DB 참조 힌트)
         # Lazy initialization으로 첫 사용 시 인덱스 구축
         self.hint_engine = None
@@ -3719,7 +4204,7 @@ class POSExtractorV52:
                 logger=self.log
             )
             self.log.info("ReferenceHintEngine 초기화 완료")
-        
+
         # SemanticMatcher (DB 임베딩 활용)
         self.semantic_matcher = None
         if self.config.enable_semantic_search:
@@ -3772,7 +4257,18 @@ class POSExtractorV52:
             
             spath = specdb_path or self.config.specdb_path
             self.specdb = LightweightSpecDBIndex(file_path=spath) if spath and os.path.exists(spath) else None
-        
+
+        # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
+        self.synonym_manager = SynonymManager()
+        if self.glossary and hasattr(self.glossary, 'df') and not self.glossary.df.empty:
+            self.synonym_manager.build_from_glossary(self.glossary.df)
+            self.log.info("SynonymManager 초기화 완료")
+        elif self.config.data_source_mode == "db" and self.pg_loader:
+            glossary_df = self.pg_loader.load_glossary_from_db()
+            if not glossary_df.empty:
+                self.synonym_manager.build_from_glossary(glossary_df)
+                self.log.info("SynonymManager 초기화 완료 (DB)")
+
         # SemanticMatcher
         self.semantic_matcher = None
         if self.config.enable_semantic_search:
