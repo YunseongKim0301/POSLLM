@@ -33,6 +33,7 @@ import shutil
 import hashlib
 import logging
 import traceback
+import threading
 from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional, Set, Union
@@ -356,16 +357,51 @@ def extract_numeric_value(text: str) -> Optional[float]:
     return None
 
 
-def is_numeric_spec(spec_name: str, value_format: str = "") -> bool:
-    """숫자형 사양인지 판단 (v2에서 추가)"""
+def is_numeric_spec(spec_name: str, value_format: str = "", confidence_level: bool = False) -> bool:
+    """
+    숫자형 사양인지 판단 (DB 기반 + 키워드 힌트)
+
+    우선순위:
+    1. value_format (용어집 DB) - 절대 규칙
+    2. numeric_keywords - 참조 힌트 (유연한 판단)
+
+    Args:
+        spec_name: 사양명
+        value_format: 용어집의 value_format 컬럼 (NUMERIC/TEXT/MIXED)
+        confidence_level: True이면 (is_numeric, confidence) 튜플 반환
+
+    Returns:
+        bool 또는 (bool, float) - confidence_level=True인 경우
+    """
+    # 1. value_format 우선 (DB 기반, 신뢰도 높음)
+    if value_format:
+        vf_upper = value_format.upper()
+        if vf_upper == "NUMERIC":
+            return (True, 1.0) if confidence_level else True
+        elif vf_upper == "TEXT":
+            return (False, 1.0) if confidence_level else False
+        elif vf_upper == "MIXED":
+            return (True, 0.7) if confidence_level else True  # Mixed는 부분적으로 숫자
+
+    # 2. 키워드 힌트 (참조용, 신뢰도 중간)
     numeric_keywords = [
         'capacity', 'head', 'power', 'pressure', 'temperature',
         'flow', 'speed', 'rpm', 'voltage', 'frequency', 'weight',
         'qty', 'quantity', 'no.', 'number', 'length', 'width', 'height',
-        'diameter', 'thickness', 'volume', 'area', 'mcr', 'ncr'
+        'diameter', 'thickness', 'volume', 'area', 'mcr', 'ncr',
+        'current', 'ampere', 'resistance', 'time', 'rate', 'efficiency'
     ]
+
     spec_lower = spec_name.lower()
-    return any(kw in spec_lower for kw in numeric_keywords)
+    keyword_match = any(kw in spec_lower for kw in numeric_keywords)
+
+    if confidence_level:
+        if keyword_match:
+            return (True, 0.6)  # 키워드 매칭: 중간 신뢰도
+        else:
+            return (False, 0.5)  # 불확실: 낮은 신뢰도
+    else:
+        return keyword_match
 
 
 def detect_checkbox_selection(text: str) -> Optional[str]:
@@ -3744,45 +3780,101 @@ class RuleBasedExtractor:
                                 confidence=confidence,
                                 reference_source=f"section:{hint.section_num}"
                             )
-        
-        # 전략 1: 테이블 검색 (모든 변형 시도)
-        for variant in spec_variants:
-            result = parser.find_value_in_tables(variant, spec.equipment)
-            
-            if result:
-                value, unit, chunk = result
-                if value:
-                    confidence = self._calculate_confidence(spec, value, unit, hint)
-                    # 동의어로 찾은 경우 약간 낮은 신뢰도
-                    if variant != spec.spec_name:
-                        confidence *= 0.95
-                    return ExtractionResult(
-                        spec_item=spec,
-                        value=value,
-                        unit=unit or spec.expected_unit,
-                        chunk=chunk,
-                        method="RULE_TABLE_DIRECT",
-                        confidence=confidence
-                    )
-        
-        # 전략 2: 키워드 기반 텍스트 검색 (모든 변형 시도)
-        for variant in spec_variants:
-            result = parser.find_value_by_keyword_search(variant, spec.equipment)
-            
-            if result:
-                value, unit, chunk = result
-                if value:
-                    confidence = self._calculate_confidence(spec, value, unit) * 0.9
-                    if variant != spec.spec_name:
-                        confidence *= 0.95
-                    return ExtractionResult(
-                        spec_item=spec,
-                        value=value,
-                        unit=unit or spec.expected_unit,
-                        chunk=chunk,
-                        method="RULE_KEYWORD_SEARCH",
-                        confidence=confidence
-                    )
+
+        # table_text 힌트에 따라 검색 우선순위 조정
+        # Y: 테이블 우선 검색, N: 텍스트 우선 검색
+        prefer_table = True
+        if hint and hint.table_text:
+            prefer_table = (hint.table_text.upper() == "Y")
+
+        # 전략 1a: 테이블 검색 (table_text=Y이거나 힌트 없음)
+        if prefer_table:
+            for variant in spec_variants:
+                result = parser.find_value_in_tables(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit, hint)
+                        # table_text 힌트와 일치하면 신뢰도 상승
+                        if hint and hint.table_text and hint.table_text.upper() == "Y":
+                            confidence *= 1.05  # 5% 보너스
+                        # 동의어로 찾은 경우 약간 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TABLE_DIRECT",
+                            confidence=confidence,
+                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                        )
+
+        # 전략 1b: 텍스트 검색 (table_text=N이면 우선)
+        if not prefer_table:
+            for variant in spec_variants:
+                result = parser.find_value_by_keyword_search(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit) * 0.9
+                        # table_text 힌트와 일치하면 신뢰도 상승
+                        if hint and hint.table_text and hint.table_text.upper() == "N":
+                            confidence *= 1.1  # 10% 보너스
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TEXT_SEARCH",
+                            confidence=confidence,
+                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                        )
+
+        # 전략 2: 반대 방향 검색 (테이블 우선이었으면 텍스트, 텍스트 우선이었으면 테이블)
+        if prefer_table:
+            # 테이블에서 못 찾았으면 텍스트 시도
+            for variant in spec_variants:
+                result = parser.find_value_by_keyword_search(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit) * 0.85  # 힌트 불일치로 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TEXT_FALLBACK",
+                            confidence=confidence
+                        )
+        else:
+            # 텍스트에서 못 찾았으면 테이블 시도
+            for variant in spec_variants:
+                result = parser.find_value_in_tables(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit, hint) * 0.85  # 힌트 불일치로 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TABLE_FALLBACK",
+                            confidence=confidence
+                        )
         
         return None
     
@@ -3979,16 +4071,18 @@ class UnifiedLLMClient:
 
         return "", 0, 0
 
-    def generate_with_voting(self, prompt: str, vote_k: int = 3, min_agreement: int = 2) -> Tuple[str, int, int]:
+    def generate_with_voting(self, prompt: str, vote_k: int = 3, min_agreement: int = 2, parallel_workers: int = 2) -> Tuple[str, int, int]:
         """
-        Voting 기능을 사용한 LLM 응답 생성
+        Voting 기능을 사용한 LLM 응답 생성 (병렬 처리)
 
         여러 번 호출하여 가장 많이 나온 응답 선택
+        2개 포트를 동시 활용하여 병렬 처리 (40GB VRAM에서 gemma3:27b 2개 동시 serve 가능)
 
         Args:
             prompt: 프롬프트
             vote_k: 투표 횟수
             min_agreement: 최소 일치 수
+            parallel_workers: 병렬 호출 수 (기본 2, gemma3:27b 2개 포트)
 
         Returns:
             (most_common_response, total_input_tokens, total_output_tokens)
@@ -4000,14 +4094,27 @@ class UnifiedLLMClient:
         total_input = 0
         total_output = 0
 
-        for i in range(vote_k):
-            text, in_tok, out_tok = self.generate(prompt)
-            if text:
-                responses.append(text)
-                total_input += in_tok
-                total_output += out_tok
-            else:
-                self.logger.warning(f"Voting 호출 {i+1}/{vote_k} 실패")
+        # 병렬 처리로 속도 향상
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def call_generate():
+            return self.generate(prompt)
+
+        # vote_k개를 parallel_workers개씩 나눠서 처리
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            futures = [executor.submit(call_generate) for _ in range(vote_k)]
+
+            for i, future in enumerate(as_completed(futures), 1):
+                try:
+                    text, in_tok, out_tok = future.result(timeout=self.timeout)
+                    if text:
+                        responses.append(text)
+                        total_input += in_tok
+                        total_output += out_tok
+                    else:
+                        self.logger.warning(f"Voting 호출 {i}/{vote_k} 실패")
+                except Exception as e:
+                    self.logger.warning(f"Voting 호출 {i}/{vote_k} 오류: {e}")
 
         if not responses:
             return "", 0, 0
@@ -4018,7 +4125,7 @@ class UnifiedLLMClient:
         most_common_response, count = counter.most_common(1)[0]
 
         if count >= min_agreement:
-            self.logger.info(f"Voting 성공: {count}/{vote_k}개 일치")
+            self.logger.info(f"Voting 성공: {count}/{vote_k}개 일치 (병렬 처리: {parallel_workers} workers)")
             return most_common_response, total_input, total_output
         else:
             self.logger.warning(f"Voting 합의 실패: 최대 {count}/{vote_k}개 일치 (최소 {min_agreement}개 필요)")
@@ -4267,7 +4374,193 @@ class LLMFallbackExtractor:
             self.log.debug("LLM 응답 없음: spec=%s", spec.spec_name)
 
         return None
-    
+
+    def extract_batch(
+        self,
+        parser: HTMLChunkParser,
+        specs: List[SpecItem],
+        hints: Dict[str, ExtractionHint] = None,
+        max_chunk_chars: int = 8000
+    ) -> List[Optional[ExtractionResult]]:
+        """
+        배치 추출: 여러 사양값을 하나의 LLM 호출로 처리 (대량 추출 최적화)
+
+        30만개 사양값을 2-3일 내 처리를 위한 핵심 기능
+        15개 spec을 하나의 프롬프트로 전송하여 속도 향상
+
+        Args:
+            parser: HTML 파서
+            specs: 추출할 사양 항목 리스트 (최대 15개 권장)
+            hints: 사양별 힌트 딕셔너리 {spec_name: hint}
+            max_chunk_chars: 최대 청크 크기
+
+        Returns:
+            ExtractionResult 리스트 (실패 시 None)
+        """
+        if not HAS_REQUESTS:
+            self.log.warning("requests 모듈 없음. Batch 추출 비활성화")
+            return [None] * len(specs)
+
+        if len(specs) > 20:
+            self.log.warning("Batch 크기가 너무 큼 (%d개). 20개 이하 권장", len(specs))
+
+        # 관련 청크 추출 (전체 문서 사용)
+        chunk = parser.get_full_text()[:max_chunk_chars]
+
+        if not chunk:
+            self.log.debug("Batch 추출 스킵: 청크 없음")
+            return [None] * len(specs)
+
+        # 배치 프롬프트 생성
+        prompt = self._build_batch_prompt(specs, chunk, hints or {})
+
+        # LLM 호출 (Voting 사용 시 정확도 향상)
+        self.log.debug("Batch LLM 호출 시작: %d개 spec", len(specs))
+        if self.llm_client and self.use_voting:
+            try:
+                response, _, _ = self.llm_client.generate_with_voting(
+                    prompt=prompt,
+                    vote_k=2,  # Batch는 voting 횟수 줄임 (속도 우선)
+                    min_agreement=2
+                )
+            except Exception as e:
+                self.log.warning("Batch voting 실패, 일반 호출로 fallback: %s", e)
+                response = self._call_ollama(prompt)
+        else:
+            response = self._call_ollama(prompt)
+
+        if response:
+            results = self._parse_batch_response(response, specs, chunk)
+            success_count = sum(1 for r in results if r and r.value)
+            self.log.debug("Batch 파싱 완료: %d/%d 성공", success_count, len(specs))
+            return results
+        else:
+            self.log.debug("Batch LLM 응답 없음")
+
+        return [None] * len(specs)
+
+    def _build_batch_prompt(
+        self,
+        specs: List[SpecItem],
+        chunk: str,
+        hints: Dict[str, ExtractionHint]
+    ) -> str:
+        """
+        배치 추출용 프롬프트 생성
+
+        15개 사양을 하나의 프롬프트로 구성
+        """
+        # 사양 목록 구성
+        spec_list = []
+        for idx, spec in enumerate(specs, 1):
+            hint = hints.get(spec.spec_name)
+            hint_text = ""
+
+            if hint:
+                hint_parts = []
+                if hint.historical_values:
+                    examples = ', '.join(hint.historical_values[:2])
+                    hint_parts.append(f"예시: {examples}")
+                if hint.pos_umgv_desc and hint.pos_umgv_desc != spec.spec_name:
+                    hint_parts.append(f"다른이름: {hint.pos_umgv_desc}")
+
+                if hint_parts:
+                    hint_text = f" ({', '.join(hint_parts)})"
+
+            spec_list.append(
+                f"{idx}. 사양명: {spec.spec_name}, "
+                f"장비: {spec.equipment or '미지정'}, "
+                f"예상단위: {spec.expected_unit or '미지정'}{hint_text}"
+            )
+
+        spec_section = "\n".join(spec_list)
+
+        prompt = f"""당신은 POS 문서에서 여러 사양값을 한 번에 추출하는 전문가입니다.
+
+## 추출 대상 ({len(specs)}개)
+{spec_section}
+
+## 문서 내용
+```
+{chunk}
+```
+
+## 작업
+위 문서에서 각 사양의 값을 찾아 추출하세요.
+값을 찾지 못한 경우 빈 문자열("")로 표시하세요.
+
+## 출력 형식 (JSON Array)
+정확히 다음 형식으로만 응답하세요:
+```json
+[
+  {{"spec_index": 1, "value": "추출된값1", "unit": "단위1", "confidence": 0.9}},
+  {{"spec_index": 2, "value": "추출된값2", "unit": "단위2", "confidence": 0.8}},
+  ...
+]
+```
+
+중요: 반드시 {len(specs)}개의 결과를 JSON Array로 반환하세요."""
+
+        return prompt
+
+    def _parse_batch_response(
+        self,
+        response: str,
+        specs: List[SpecItem],
+        chunk: str
+    ) -> List[Optional[ExtractionResult]]:
+        """
+        배치 응답 파싱
+
+        JSON Array를 파싱하여 각 spec에 대한 ExtractionResult 생성
+        """
+        results = [None] * len(specs)
+
+        try:
+            # JSON 추출
+            json_match = re.search(r'\[[\s\S]*\]', response)
+            if not json_match:
+                self.log.warning("Batch 응답에서 JSON Array를 찾을 수 없음")
+                return results
+
+            json_str = json_match.group(0)
+            parsed = json.loads(json_str)
+
+            if not isinstance(parsed, list):
+                self.log.warning("Batch 응답이 Array가 아님")
+                return results
+
+            # 각 결과를 ExtractionResult로 변환
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+
+                spec_index = item.get('spec_index', 0) - 1  # 0-based index
+                if spec_index < 0 or spec_index >= len(specs):
+                    continue
+
+                value = str(item.get('value', '')).strip()
+                unit = str(item.get('unit', '')).strip()
+                confidence = float(item.get('confidence', 0.0))
+
+                if value:
+                    spec = specs[spec_index]
+                    results[spec_index] = ExtractionResult(
+                        value=value,
+                        unit=unit,
+                        confidence=confidence,
+                        method="llm_batch",
+                        chunk=chunk[:500],
+                        evidence=f"Batch extraction from {len(specs)} specs"
+                    )
+
+        except json.JSONDecodeError as e:
+            self.log.warning("Batch 응답 JSON 파싱 실패: %s", e)
+        except Exception as e:
+            self.log.warning("Batch 응답 파싱 오류: %s", e)
+
+        return results
+
     def _get_relevant_chunk(
         self, 
         parser: HTMLChunkParser, 
@@ -4648,40 +4941,20 @@ class POSExtractorV52:
                     self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
                     self.pg_loader = None
         
-        # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
-        self.synonym_manager = SynonymManager()
-        if self.glossary and hasattr(self.glossary, 'df') and not self.glossary.df.empty:
-            self.synonym_manager.build_from_glossary(self.glossary.df)
-            self.log.info("SynonymManager 초기화 완료")
-        elif self.config.data_source_mode == "db" and self.pg_loader:
-            # DB 모드에서 용어집 다시 로드하여 SynonymManager 구축
-            glossary_df = self.pg_loader.load_glossary_from_db()
-            if not glossary_df.empty:
-                self.synonym_manager.build_from_glossary(glossary_df)
-                self.log.info("SynonymManager 초기화 완료 (DB)")
+        # SynonymManager 초기화 (Lazy loading으로 변경 - 초기화 시간 단축)
+        self.synonym_manager = None
+        self._synonym_manager_initialized = False
+        self.log.info("SynonymManager: Lazy loading 모드 (첫 사용 시 초기화)")
 
-        # ReferenceHintEngine 초기화 (용어집/사양값DB 참조 힌트)
-        # Lazy initialization으로 첫 사용 시 인덱스 구축
+        # ReferenceHintEngine 초기화 (Lazy loading - 첫 사용 시 초기화)
         self.hint_engine = None
-        if self.glossary or self.specdb:
-            self.hint_engine = ReferenceHintEngine(
-                glossary=self.glossary,
-                specdb=self.specdb,
-                pg_loader=self.pg_loader,
-                logger=self.log
-            )
-            self.log.info("ReferenceHintEngine 초기화 완료")
+        self._hint_engine_initialized = False
+        self.log.info("ReferenceHintEngine: Lazy loading 모드 (첫 사용 시 초기화)")
 
-        # SemanticMatcher (DB 임베딩 활용)
+        # SemanticMatcher (Lazy loading - 첫 사용 시 초기화)
         self.semantic_matcher = None
-        if self.config.enable_semantic_search:
-            self.semantic_matcher = SemanticMatcher(
-                model_path=self.config.semantic_model_path,
-                device=self.config.semantic_device,
-                similarity_threshold=self.config.semantic_similarity_threshold,
-                pg_loader=self.pg_loader,
-                logger=self.log
-            )
+        self._semantic_matcher_initialized = False
+        self.log.info("SemanticMatcher: Lazy loading 모드 (첫 사용 시 초기화)")
         
         elapsed = time.time() - start
         self.log.info("Light 모드 초기화 완료: %.2f초", elapsed)
@@ -4748,26 +5021,15 @@ class POSExtractorV52:
                     self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
                     self.pg_loader = None
 
-        # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
-        self.synonym_manager = SynonymManager()
-        if self.glossary and hasattr(self.glossary, 'df') and not self.glossary.df.empty:
-            self.synonym_manager.build_from_glossary(self.glossary.df)
-            self.log.info("SynonymManager 초기화 완료")
-        elif self.config.data_source_mode == "db" and self.pg_loader:
-            glossary_df = self.pg_loader.load_glossary_from_db()
-            if not glossary_df.empty:
-                self.synonym_manager.build_from_glossary(glossary_df)
-                self.log.info("SynonymManager 초기화 완료 (DB)")
+        # SynonymManager 초기화 (Lazy loading으로 변경 - 초기화 시간 단축)
+        self.synonym_manager = None
+        self._synonym_manager_initialized = False
+        self.log.info("SynonymManager: Lazy loading 모드 (첫 사용 시 초기화)")
 
-        # SemanticMatcher
+        # SemanticMatcher (Lazy loading - 첫 사용 시 초기화)
         self.semantic_matcher = None
-        if self.config.enable_semantic_search:
-            self.semantic_matcher = SemanticMatcher(
-                model_path=self.config.semantic_model_path,
-                device=self.config.semantic_device,
-                pg_loader=self.pg_loader,
-                logger=self.log
-            )
+        self._semantic_matcher_initialized = False
+        self.log.info("SemanticMatcher: Lazy loading 모드 (첫 사용 시 초기화)")
         
         elapsed = time.time() - start
         self.log.info("Full 모드 초기화 완료: %.2f초", elapsed)
@@ -4800,9 +5062,11 @@ class POSExtractorV52:
         parser = self._get_parser(html_path)
         
         # 힌트 조회 (캐시된 경우 O(1), 아니면 동적 생성)
+        # Lazy loading: 첫 사용 시 자동 초기화
         hint = None
-        if self.hint_engine and spec.hull:
-            hint = self.hint_engine.get_hints(spec.hull, spec.spec_name)
+        hint_engine = self._get_hint_engine()
+        if hint_engine and spec.hull:
+            hint = hint_engine.get_hints(spec.hull, spec.spec_name)
         
         # 1. Rule 기반 추출 시도 (힌트 활용)
         result = self.rule_extractor.extract(parser, spec, hint)
@@ -4892,28 +5156,96 @@ class POSExtractorV52:
         # 3. 모두 실패
         self.stats['failed'] += 1
         return self._create_empty_result(spec, "EXTRACTION_FAILED")
-    
+
+    def _get_synonym_manager(self) -> 'SynonymManager':
+        """
+        Lazy loading: SynonymManager 초기화 (첫 호출 시)
+
+        초기화 시간 단축을 위해 필요할 때만 생성
+        """
+        if not self._synonym_manager_initialized:
+            self.synonym_manager = SynonymManager()
+
+            if self.glossary and hasattr(self.glossary, 'df') and not self.glossary.df.empty:
+                self.synonym_manager.build_from_glossary(self.glossary.df)
+                self.log.info("SynonymManager 초기화 완료 (Lazy)")
+            elif self.config.data_source_mode == "db" and self.pg_loader:
+                glossary_df = self.pg_loader.load_glossary_from_db()
+                if not glossary_df.empty:
+                    self.synonym_manager.build_from_glossary(glossary_df)
+                    self.log.info("SynonymManager 초기화 완료 (DB, Lazy)")
+
+            self._synonym_manager_initialized = True
+
+        return self.synonym_manager
+
+    def _get_hint_engine(self) -> 'ReferenceHintEngine':
+        """
+        Lazy loading: ReferenceHintEngine 초기화 (첫 호출 시)
+
+        초기화 시간 단축을 위해 필요할 때만 생성
+        """
+        if not self._hint_engine_initialized:
+            if self.glossary or self.specdb:
+                self.hint_engine = ReferenceHintEngine(
+                    glossary=self.glossary,
+                    specdb=self.specdb,
+                    pg_loader=self.pg_loader,
+                    logger=self.log
+                )
+                self.log.info("ReferenceHintEngine 초기화 완료 (Lazy)")
+            self._hint_engine_initialized = True
+
+        return self.hint_engine
+
+    def _get_semantic_matcher(self) -> 'SemanticMatcher':
+        """
+        Lazy loading: SemanticMatcher 초기화 (첫 호출 시)
+
+        초기화 시간 단축을 위해 필요할 때만 생성
+        """
+        if not self._semantic_matcher_initialized:
+            if self.config.enable_semantic_search:
+                try:
+                    self.semantic_matcher = SemanticMatcher(
+                        model_path=self.config.semantic_model_path,
+                        device=self.config.semantic_device,
+                        similarity_threshold=self.config.semantic_similarity_threshold,
+                        pg_loader=self.pg_loader,
+                        logger=self.log
+                    )
+                    self.log.info("SemanticMatcher 초기화 완료 (Lazy)")
+                except Exception as e:
+                    self.log.warning("SemanticMatcher 초기화 실패: %s", e)
+                    self.semantic_matcher = None
+
+            self._semantic_matcher_initialized = True
+
+        return self.semantic_matcher
+
     def preload_hints_for_file(self, file_path: str, hull: str = ""):
         """
         특정 파일 처리 전 힌트 배치 로드 (효율성 최적화)
-        
+
         파일 처리 루프에서 첫 파일 처리 전 호출하면
         해당 hull의 모든 사양 힌트가 캐시에 로드됩니다.
-        
+
         Args:
             file_path: HTML 파일 경로
             hull: 호선 번호 (없으면 파일명에서 추출 시도)
         """
-        if not self.hint_engine:
+        # Lazy loading: 첫 사용 시 자동 초기화
+        hint_engine = self._get_hint_engine()
+        if not hint_engine:
             return
-        
+
         # hull 추출
         if not hull:
             filename = os.path.basename(file_path)
             hull = self._extract_hull_from_filename(filename)
-        
+
         if hull:
-            self.hint_engine.preload_for_hull(hull)
+            hint_engine.preload_for_hull(hull)
             self.log.debug("힌트 배치 로드 완료: hull=%s", hull)
     
     def _extract_hull_from_filename(self, filename: str) -> str:
@@ -5092,18 +5424,68 @@ class POSExtractorV52:
                 if hull:
                     self.preload_hints_for_file(html_file, hull)
 
-                # 각 사양 항목 추출
+                # 힌트 딕셔너리 준비 (Lazy loading)
+                hints_dict = {}
+                hint_engine = self._get_hint_engine()
+                if hint_engine:
+                    for spec in file_specs:
+                        hint = hint_engine.get_hints(spec.hull, spec.spec_name)
+                        if hint:
+                            hints_dict[spec.spec_name] = hint
+
+                # 배치 추출 (15개씩 묶어서 처리)
                 file_results = []
-                for spec_idx, spec in enumerate(file_specs, 1):
-                    self.log.debug("  [%d/%d] 추출: %s", spec_idx, len(file_specs), spec.spec_name)
+                batch_size = self.config.full_mode_batch_size  # 기본 15개
+                parser = self._get_parser(html_file)
 
-                    result = self.extract_single(html_file, spec)
-                    file_results.append(result)
+                for batch_start in range(0, len(file_specs), batch_size):
+                    batch_specs = file_specs[batch_start:batch_start + batch_size]
+                    batch_end = min(batch_start + batch_size, len(file_specs))
 
-                    if result.get('pos_umgv_value'):
-                        total_extracted += 1
+                    self.log.info("  Batch 추출: [%d-%d/%d]", batch_start + 1, batch_end, len(file_specs))
+
+                    # Batch 추출 시도 (LLM Fallback이 있는 경우)
+                    batch_results = None
+                    if self.llm_fallback and len(batch_specs) > 1:
+                        try:
+                            batch_results = self.llm_fallback.extract_batch(
+                                parser=parser,
+                                specs=batch_specs,
+                                hints=hints_dict
+                            )
+                        except Exception as e:
+                            self.log.warning("Batch 추출 실패, 개별 추출로 fallback: %s", e)
+
+                    # Batch 실패 시 개별 추출
+                    if not batch_results or all(r is None for r in batch_results):
+                        self.log.debug("  개별 추출로 fallback")
+                        for spec_idx, spec in enumerate(batch_specs, batch_start + 1):
+                            result = self.extract_single(html_file, spec)
+                            file_results.append(result)
+
+                            if result.get('pos_umgv_value'):
+                                total_extracted += 1
+                            else:
+                                total_failed += 1
                     else:
-                        total_failed += 1
+                        # Batch 결과 처리
+                        for spec_idx, (spec, extraction_result) in enumerate(zip(batch_specs, batch_results), batch_start + 1):
+                            if extraction_result and extraction_result.value:
+                                # LLM Batch 결과를 Dict로 변환
+                                result_dict = self._create_result(extraction_result, spec, html_file, hints_dict.get(spec.spec_name))
+                                file_results.append(result_dict)
+                                total_extracted += 1
+                                self.log.debug("    [%d] %s: %s", spec_idx, spec.spec_name, extraction_result.value)
+                            else:
+                                # Batch에서 실패한 항목은 개별 추출 시도
+                                self.log.debug("    [%d] Batch 실패, 개별 추출: %s", spec_idx, spec.spec_name)
+                                result = self.extract_single(html_file, spec)
+                                file_results.append(result)
+
+                                if result.get('pos_umgv_value'):
+                                    total_extracted += 1
+                                else:
+                                    total_failed += 1
 
                 all_results.extend(file_results)
                 batch_results.extend(file_results)
@@ -5272,7 +5654,304 @@ class POSExtractorV52:
                 self.log.error("CSV 저장 실패: %s", e)
 
         return saved_files
-    
+
+    def extract_verify(
+        self,
+        html_folder: str = None,
+        verify_sample_size: int = 100
+    ) -> Dict[str, Any]:
+        """
+        Verify 모드: umgv_fin 기반 검증
+
+        기존 추출 결과(umgv_fin)를 검증하여 정확도 측정
+        POS 문서에서 값을 찾아 맥락 기반으로 검증
+
+        Args:
+            html_folder: HTML 파일이 있는 폴더
+            verify_sample_size: 검증할 샘플 수 (0=전체)
+
+        Returns:
+            검증 결과 딕셔너리
+        """
+        self.log.info("=" * 80)
+        self.log.info("Verify 모드 시작")
+        self.log.info("=" * 80)
+
+        # 폴더 설정
+        folder = html_folder or self.config.light_mode_pos_folder
+        if not folder or not os.path.exists(folder):
+            raise ValueError(f"HTML 폴더를 찾을 수 없습니다: {folder}")
+
+        # umgv_fin 테이블에서 검증 대상 로드
+        if not self.pg_loader:
+            raise RuntimeError("PostgreSQL 연결이 필요합니다 (DB 모드)")
+
+        specdb_df = self.pg_loader.load_specdb_from_db()
+        if specdb_df.empty:
+            raise RuntimeError("umgv_fin 테이블이 비어있습니다")
+
+        self.log.info("umgv_fin에서 %d개 레코드 로드", len(specdb_df))
+
+        # 샘플링
+        if verify_sample_size > 0 and len(specdb_df) > verify_sample_size:
+            specdb_df = specdb_df.sample(n=verify_sample_size, random_state=42)
+            self.log.info("샘플링: %d개 레코드 선택", len(specdb_df))
+
+        # 검증 통계
+        total = 0
+        verified = 0
+        mismatched = 0
+        not_found = 0
+        errors = 0
+
+        verification_results = []
+
+        for idx, row in specdb_df.iterrows():
+            total += 1
+
+            try:
+                # POS 문서 경로 추출
+                doknr = row.get('doknr', '')
+                if not doknr:
+                    errors += 1
+                    continue
+
+                # HTML 파일 찾기
+                html_file = self._find_html_file(folder, doknr)
+                if not html_file:
+                    not_found += 1
+                    self.log.debug("[%d/%d] POS 파일 없음: %s", total, len(specdb_df), doknr)
+                    continue
+
+                # 검증 수행
+                verify_result = self._verify_single(html_file, row)
+
+                verification_results.append(verify_result)
+
+                if verify_result['status'] == 'verified':
+                    verified += 1
+                elif verify_result['status'] == 'mismatched':
+                    mismatched += 1
+                    self.log.warning("[%d/%d] 불일치: %s - 기대 '%s', 발견 '%s'",
+                                    total, len(specdb_df),
+                                    verify_result['spec_name'],
+                                    verify_result['expected_value'],
+                                    verify_result['found_value'])
+                else:
+                    not_found += 1
+
+            except Exception as e:
+                errors += 1
+                self.log.error("검증 오류: %s", e)
+
+        # 결과 요약
+        accuracy = (verified / total * 100) if total > 0 else 0.0
+
+        self.log.info("=" * 80)
+        self.log.info("Verify 모드 완료")
+        self.log.info("=" * 80)
+        self.log.info("총 검증: %d", total)
+        self.log.info("일치: %d (%.1f%%)", verified, verified / total * 100 if total > 0 else 0)
+        self.log.info("불일치: %d (%.1f%%)", mismatched, mismatched / total * 100 if total > 0 else 0)
+        self.log.info("미발견: %d (%.1f%%)", not_found, not_found / total * 100 if total > 0 else 0)
+        self.log.info("오류: %d", errors)
+        self.log.info("정확도: %.1f%%", accuracy)
+
+        return {
+            "status": "completed",
+            "mode": "verify",
+            "total": total,
+            "verified": verified,
+            "mismatched": mismatched,
+            "not_found": not_found,
+            "errors": errors,
+            "accuracy": accuracy,
+            "results": verification_results
+        }
+
+    def _find_html_file(self, folder: str, doknr: str) -> Optional[str]:
+        """
+        doknr를 기반으로 HTML 파일 찾기
+
+        파일명 패턴: XXXX-POS-YYYYYYY...
+        """
+        # doknr에서 hull 추출
+        hull_match = re.search(r'(\d{4})', doknr)
+        if not hull_match:
+            return None
+
+        hull = hull_match.group(1)
+
+        # 파일명 매칭
+        for filename in os.listdir(folder):
+            if filename.lower().endswith('.html') and hull in filename:
+                # doknr의 주요 부분이 파일명에 포함되어 있는지 확인
+                if doknr[:10] in filename or hull in filename[:4]:
+                    return os.path.join(folder, filename)
+
+        return None
+
+    def _verify_single(self, html_file: str, row: pd.Series) -> Dict[str, Any]:
+        """
+        단일 사양값 검증
+
+        맥락 기반 단계적 탐색:
+        1. Section 탐색 (section_num 기준)
+        2. Table 탐색 (테이블 구조 기반)
+        3. Full document 탐색
+
+        Args:
+            html_file: HTML 파일 경로
+            row: umgv_fin 레코드
+
+        Returns:
+            검증 결과 딕셔너리
+        """
+        spec_name = row.get('umgv_desc', '')
+        expected_value = str(row.get('umgv_value', '')).strip()
+        expected_unit = str(row.get('umgv_uom', '')).strip()
+
+        parser = self._get_parser(html_file)
+
+        # 1단계: Section 기반 탐색
+        section_num = row.get('section_num', '')
+        if section_num:
+            found = self._search_in_section(parser, spec_name, section_num, expected_value, expected_unit)
+            if found:
+                return {
+                    'status': 'verified',
+                    'spec_name': spec_name,
+                    'expected_value': expected_value,
+                    'found_value': found['value'],
+                    'method': 'section_search'
+                }
+
+        # 2단계: Table 기반 탐색
+        found = self._search_in_tables(parser, spec_name, expected_value, expected_unit)
+        if found:
+            return {
+                'status': 'verified',
+                'spec_name': spec_name,
+                'expected_value': expected_value,
+                'found_value': found['value'],
+                'method': 'table_search'
+            }
+
+        # 3단계: Full document 탐색
+        found = self._search_in_full_document(parser, spec_name, expected_value, expected_unit)
+        if found:
+            return {
+                'status': 'verified',
+                'spec_name': spec_name,
+                'expected_value': expected_value,
+                'found_value': found['value'],
+                'method': 'full_document_search'
+            }
+
+        # 값을 찾지 못함
+        return {
+            'status': 'not_found',
+            'spec_name': spec_name,
+            'expected_value': expected_value,
+            'found_value': '',
+            'method': 'none'
+        }
+
+    def _search_in_section(
+        self,
+        parser: HTMLChunkParser,
+        spec_name: str,
+        section_num: str,
+        expected_value: str,
+        expected_unit: str
+    ) -> Optional[Dict]:
+        """Section 내에서 값 탐색"""
+        full_text = parser.get_full_text()
+
+        # Section 위치 찾기
+        section_match = re.search(re.escape(section_num[:20]), full_text, re.IGNORECASE)
+        if not section_match:
+            return None
+
+        # Section 주변 텍스트 추출 (±500자)
+        start = max(0, section_match.start() - 500)
+        end = min(len(full_text), section_match.end() + 1500)
+        section_text = full_text[start:end]
+
+        # 사양명과 값 찾기
+        if spec_name.upper() in section_text.upper():
+            # 유사값 탐색 (단위 변환, 정제 고려)
+            if self._is_similar_value(expected_value, section_text):
+                return {'value': expected_value, 'confidence': 0.8}
+
+        return None
+
+    def _search_in_tables(
+        self,
+        parser: HTMLChunkParser,
+        spec_name: str,
+        expected_value: str,
+        expected_unit: str
+    ) -> Optional[Dict]:
+        """Table 내에서 값 탐색"""
+        # HTMLChunkParser의 테이블 검색 활용
+        keywords = [spec_name] + spec_name.upper().split()
+        table_results = parser.search_in_tables_enhanced(keywords[:3])
+
+        for result in table_results:
+            value = result.get('value', '')
+            if self._is_similar_value(expected_value, value):
+                return {'value': value, 'confidence': 0.9}
+
+        return None
+
+    def _search_in_full_document(
+        self,
+        parser: HTMLChunkParser,
+        spec_name: str,
+        expected_value: str,
+        expected_unit: str
+    ) -> Optional[Dict]:
+        """전체 문서에서 값 탐색"""
+        full_text = parser.get_full_text()
+
+        # 사양명 근처에서 값 찾기
+        spec_pattern = re.escape(spec_name[:20])
+        matches = list(re.finditer(spec_pattern, full_text, re.IGNORECASE))
+
+        for match in matches:
+            context_start = max(0, match.start() - 100)
+            context_end = min(len(full_text), match.end() + 200)
+            context = full_text[context_start:context_end]
+
+            if self._is_similar_value(expected_value, context):
+                return {'value': expected_value, 'confidence': 0.7}
+
+        return None
+
+    def _is_similar_value(self, expected: str, text: str) -> bool:
+        """
+        값 유사도 판단 (단위 변환, 정제 고려)
+
+        예: "60°C" vs "60 deg C", "15~20" vs "15 to 20"
+        """
+        expected_norm = expected.upper().replace(' ', '').replace('~', '-')
+
+        # 숫자만 추출하여 비교
+        expected_nums = re.findall(r'[\d.]+', expected)
+        text_nums = re.findall(r'[\d.]+', text)
+
+        # 주요 숫자가 포함되어 있는지 확인
+        for num in expected_nums:
+            if num in text_nums or num in text:
+                return True
+
+        # 정규화된 문자열 포함 여부
+        if expected_norm and expected_norm in text.upper().replace(' ', ''):
+            return True
+
+        return False
+
     def _detect_format(self, value: str) -> str:
         """값 형식 감지"""
         if not value:
