@@ -3662,6 +3662,772 @@ class HTMLChunkParser:
 
 
 # =============================================================================
+# 4-Stage Chunk Selection Components (v53 Enhancement)
+# =============================================================================
+
+@dataclass
+class HTMLSection:
+    """HTML 섹션 정보"""
+    section_num: str           # "1", "2", "2.A", "2.2.1", etc.
+    section_title: str         # "GENERAL", "TECHNICAL PARTICULARS", etc.
+    section_level: int         # 1, 2, 3 (depth)
+    start_pos: int            # 전체 텍스트에서의 시작 위치
+    end_pos: int              # 전체 텍스트에서의 끝 위치
+    content: str              # 섹션 전체 컨텐츠
+    tables: List[List[List[str]]] = field(default_factory=list)  # 섹션 내 테이블들
+    text_chunks: List[str] = field(default_factory=list)    # 섹션 내 텍스트 청크들
+
+
+class HTMLSectionParser:
+    """
+    HTML 문서를 섹션 단위로 파싱 (v53 신규)
+
+    POS 문서의 섹션 구조를 분석하여 Section 2 (TECHNICAL PARTICULARS) 우선 검색 지원
+    """
+
+    def __init__(self, html_content: str = "", file_path: str = "", chunk_parser: HTMLChunkParser = None):
+        self.html_content = html_content
+        self.file_path = file_path
+        self.chunk_parser = chunk_parser  # 기존 HTMLChunkParser 재사용
+        self.soup = None
+        self.sections: List[HTMLSection] = []
+        self.section_index: Dict[str, HTMLSection] = {}  # 빠른 조회용
+
+        if file_path and os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                self.html_content = f.read()
+
+        if self.html_content:
+            self._parse()
+
+    def _parse(self):
+        """HTML 파싱 및 섹션 추출"""
+        if not HAS_BS4:
+            return
+
+        self.soup = BeautifulSoup(self.html_content, 'html.parser')
+        self._extract_sections()
+        self._build_section_index()
+
+    def _extract_sections(self):
+        """
+        섹션 추출
+
+        전략:
+        1. <h1>, <h2>, <h3> 태그로 섹션 헤더 식별
+        2. 섹션 번호 패턴: "1.", "2.-A", "2.2.1", etc.
+        3. 각 섹션의 컨텐츠 범위 결정
+        """
+        full_text = self.soup.get_text()
+
+        # 섹션 헤더 패턴 매칭
+        # 예: "1. GENERAL", "2.-A. TECHNICAL PARTICULARS", "2.2.1 Main particulars"
+        section_pattern = re.compile(
+            r'^\s*(\d+(?:\.-?[A-Z]|\.\d+)*)\s*\.?\s+([A-Z][A-Z\s]+)',
+            re.MULTILINE
+        )
+
+        matches = list(section_pattern.finditer(full_text))
+
+        for i, match in enumerate(matches):
+            section_num = match.group(1).strip()
+            section_title = match.group(2).strip()
+            start_pos = match.start()
+
+            # 다음 섹션 시작 또는 문서 끝까지
+            if i + 1 < len(matches):
+                end_pos = matches[i + 1].start()
+            else:
+                end_pos = len(full_text)
+
+            content = full_text[start_pos:end_pos]
+
+            # 섹션 레벨 계산 (1, 1.A, 1.1, 1.1.1 등)
+            level = section_num.count('.') + section_num.count('-')
+
+            # 섹션 내 테이블 추출 (chunk_parser 활용)
+            tables = []
+            if self.chunk_parser:
+                # chunk_parser의 테이블 중 이 섹션에 포함된 것만
+                for table in self.chunk_parser.tables:
+                    # 간단한 휴리스틱: 테이블 첫 셀이 content에 있으면 포함
+                    if table and table[0] and any(cell in content for row in table[:2] for cell in row):
+                        tables.append(table)
+
+            section = HTMLSection(
+                section_num=section_num,
+                section_title=section_title,
+                section_level=level,
+                start_pos=start_pos,
+                end_pos=end_pos,
+                content=content,
+                tables=tables,
+                text_chunks=[content]  # 간단하게 전체를 하나의 청크로
+            )
+
+            self.sections.append(section)
+
+    def _build_section_index(self):
+        """섹션 인덱스 구축 (빠른 조회용)"""
+        for section in self.sections:
+            self.section_index[section.section_num] = section
+            # 정규화된 번호도 인덱싱 ("2.-A" → "2.A")
+            normalized = section.section_num.replace('.-', '.')
+            if normalized != section.section_num:
+                self.section_index[normalized] = section
+
+    def get_section_by_number(self, section_num: str) -> Optional[HTMLSection]:
+        """섹션 번호로 조회"""
+        return self.section_index.get(section_num)
+
+    def get_technical_sections(self) -> List[HTMLSection]:
+        """
+        Section 2 (TECHNICAL PARTICULARS) 및 하위 섹션 반환
+
+        가장 중요: 대부분의 spec은 여기서 찾아야 함
+        """
+        technical = []
+        for section in self.sections:
+            # Section 2로 시작하는 모든 섹션
+            if section.section_num.startswith('2'):
+                technical.append(section)
+        return technical
+
+    def search_in_section(
+        self,
+        section_num: str,
+        keywords: List[str],
+        context_chars: int = 200
+    ) -> List[Tuple[str, int]]:
+        """
+        특정 섹션 내에서 키워드 검색
+
+        Returns:
+            [(matching_text, position), ...] 리스트
+        """
+        section = self.get_section_by_number(section_num)
+        if not section:
+            return []
+
+        matches = []
+        for keyword in keywords:
+            # 대소문자 무시 검색
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+            for match in pattern.finditer(section.content):
+                start = max(0, match.start() - context_chars // 2)
+                end = min(len(section.content), match.end() + context_chars // 2)
+                chunk = section.content[start:end]
+                matches.append((chunk, match.start()))
+
+        return matches
+
+
+@dataclass
+class ChunkCandidate:
+    """Chunk 후보 정보"""
+    text: str                  # Chunk 텍스트
+    source: str                # 출처: "section_2a_table", "section_2_text", "keyword_search", etc.
+    section_num: str = ""      # 소속 섹션 번호
+    quality_score: float = 0.0  # 품질 점수 (0-1.0)
+    keywords_found: List[str] = field(default_factory=list)  # 발견된 키워드들
+    has_numeric: bool = False   # 숫자 포함 여부
+    is_table: bool = False      # 테이블 출처 여부
+    start_pos: int = 0          # 원본에서의 시작 위치 (확장용)
+    end_pos: int = 0            # 원본에서의 끝 위치 (확장용)
+    metadata: Dict[str, Any] = field(default_factory=dict)   # 추가 메타데이터
+
+
+class ChunkCandidateGenerator:
+    """
+    다양한 소스에서 chunk 후보 생성 (v53 신규)
+
+    전략:
+    1. Section 2 테이블 우선 검색
+    2. Hint의 section_num 활용
+    3. 사양명/장비명 키워드 검색
+    4. 동의어 확장 검색
+    """
+
+    def __init__(
+        self,
+        section_parser: HTMLSectionParser,
+        chunk_parser: HTMLChunkParser,
+        glossary: LightweightGlossaryIndex = None,
+        logger: logging.Logger = None
+    ):
+        self.section_parser = section_parser
+        self.chunk_parser = chunk_parser
+        self.glossary = glossary
+        self.log = logger or logging.getLogger(__name__)
+
+    def generate_candidates(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint = None,
+        max_candidates: int = 10
+    ) -> List[ChunkCandidate]:
+        """
+        Spec에 대한 chunk 후보들 생성
+
+        Returns:
+            최대 max_candidates개의 후보 (중복 제거)
+        """
+        candidates = []
+        seen_texts = set()  # 중복 방지
+
+        # 1. Section 2 테이블에서 검색 (최우선)
+        candidates.extend(
+            self._search_in_technical_tables(spec, hint, seen_texts)
+        )
+
+        # 2. Hint의 section_num 활용
+        if hint and hint.section_num:
+            candidates.extend(
+                self._search_in_hint_section(spec, hint, seen_texts)
+            )
+
+        # 3. 사양명 키워드 검색 (Section 2 우선)
+        candidates.extend(
+            self._keyword_search(spec, hint, seen_texts)
+        )
+
+        # 4. 동의어 확장 검색
+        if self.glossary:
+            candidates.extend(
+                self._synonym_search(spec, hint, seen_texts)
+            )
+
+        # 5. 중복 제거 및 제한
+        unique_candidates = self._deduplicate(candidates)
+        return unique_candidates[:max_candidates]
+
+    def _search_in_technical_tables(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """Section 2의 테이블에서 검색"""
+        candidates = []
+        technical_sections = self.section_parser.get_technical_sections()
+
+        spec_upper = spec.spec_name.upper()
+        equipment_upper = spec.equipment.upper() if spec.equipment else ""
+
+        for section in technical_sections:
+            for table in section.tables:
+                # 테이블에서 spec_name 검색
+                table_text = "\n".join([" | ".join(row) for row in table])
+
+                if spec_upper in table_text.upper():
+                    # 관련된 행 찾기
+                    for row in table:
+                        row_text = " | ".join(row)
+                        if spec_upper in row_text.upper():
+                            # 중복 확인
+                            if row_text not in seen_texts:
+                                seen_texts.add(row_text)
+
+                                candidates.append(ChunkCandidate(
+                                    text=row_text,
+                                    source=f"section_{section.section_num}_table",
+                                    section_num=section.section_num,
+                                    is_table=True,
+                                    has_numeric=bool(re.search(r'\d', row_text)),
+                                    keywords_found=[spec.spec_name]
+                                ))
+
+        return candidates
+
+    def _search_in_hint_section(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """Hint의 section_num에서 검색"""
+        candidates = []
+
+        # section_num에서 실제 번호 추출 ("2.2.1 Main particulars" → "2.2.1")
+        section_match = re.match(r'^(\d+(?:\.-?[A-Z]|\.\d+)*)', hint.section_num)
+        if not section_match:
+            return candidates
+
+        section_num = section_match.group(1)
+        matches = self.section_parser.search_in_section(
+            section_num,
+            [spec.spec_name, spec.equipment or ""],
+            context_chars=300
+        )
+
+        for match_text, pos in matches:
+            if match_text not in seen_texts:
+                seen_texts.add(match_text)
+
+                candidates.append(ChunkCandidate(
+                    text=match_text,
+                    source=f"hint_section_{section_num}",
+                    section_num=section_num,
+                    has_numeric=bool(re.search(r'\d', match_text)),
+                    keywords_found=[spec.spec_name],
+                    start_pos=pos
+                ))
+
+        return candidates
+
+    def _keyword_search(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """사양명 키워드 검색 (Section 2 우선)"""
+        candidates = []
+
+        # Section 2에서 먼저 검색
+        technical_sections = self.section_parser.get_technical_sections()
+        for section in technical_sections:
+            matches = self.section_parser.search_in_section(
+                section.section_num,
+                [spec.spec_name],
+                context_chars=250
+            )
+
+            for match_text, pos in matches[:3]:  # 최대 3개
+                if match_text not in seen_texts:
+                    seen_texts.add(match_text)
+
+                    candidates.append(ChunkCandidate(
+                        text=match_text,
+                        source=f"keyword_section_{section.section_num}",
+                        section_num=section.section_num,
+                        has_numeric=bool(re.search(r'\d', match_text)),
+                        keywords_found=[spec.spec_name],
+                        start_pos=pos
+                    ))
+
+        return candidates
+
+    def _synonym_search(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """동의어 확장 검색"""
+        candidates = []
+
+        # 동의어 가져오기
+        synonyms = []
+        if hint and hint.pos_umgv_desc:
+            synonyms.append(hint.pos_umgv_desc)
+
+        if self.glossary and hasattr(self.glossary, 'get_synonyms'):
+            synonyms.extend(self.glossary.get_synonyms(spec.spec_name))
+
+        # 동의어로 검색 (Section 2만)
+        for synonym in synonyms[:3]:  # 최대 3개 동의어
+            if not synonym:
+                continue
+
+            technical_sections = self.section_parser.get_technical_sections()
+            for section in technical_sections:
+                matches = self.section_parser.search_in_section(
+                    section.section_num,
+                    [synonym],
+                    context_chars=250
+                )
+
+                for match_text, pos in matches[:2]:  # 동의어당 최대 2개
+                    if match_text not in seen_texts:
+                        seen_texts.add(match_text)
+
+                        candidates.append(ChunkCandidate(
+                            text=match_text,
+                            source=f"synonym_{section.section_num}",
+                            section_num=section.section_num,
+                            has_numeric=bool(re.search(r'\d', match_text)),
+                            keywords_found=[synonym],
+                            metadata={'synonym': synonym}
+                        ))
+
+        return candidates
+
+    def _deduplicate(self, candidates: List[ChunkCandidate]) -> List[ChunkCandidate]:
+        """중복 제거 (텍스트 기준)"""
+        seen = set()
+        unique = []
+
+        for cand in candidates:
+            # 텍스트의 처음 100자로 중복 판단
+            key = cand.text[:100]
+            if key not in seen:
+                seen.add(key)
+                unique.append(cand)
+
+        return unique
+
+
+class ChunkQualityScorer:
+    """
+    Chunk 후보의 품질 평가 (v53 신규)
+
+    평가 기준:
+    1. 길이 적정성 (100-3000 chars)
+    2. 키워드 존재
+    3. 숫자 패턴
+    4. 테이블 구조
+    5. 섹션 관련성
+    """
+
+    def __init__(
+        self,
+        glossary: LightweightGlossaryIndex = None,
+        logger: logging.Logger = None
+    ):
+        self.glossary = glossary
+        self.log = logger or logging.getLogger(__name__)
+
+    def score_candidate(
+        self,
+        candidate: ChunkCandidate,
+        spec: SpecItem,
+        hint: ExtractionHint = None
+    ) -> float:
+        """
+        후보 chunk의 품질 점수 계산
+
+        Returns:
+            0.0-1.0 사이의 점수
+        """
+        score = 0.0
+
+        # 1. 길이 점수 (최대 0.2)
+        score += self._score_length(candidate)
+
+        # 2. 키워드 점수 (최대 0.3)
+        score += self._score_keywords(candidate, spec, hint)
+
+        # 3. 숫자 패턴 점수 (최대 0.15)
+        score += self._score_numeric_pattern(candidate, spec, hint)
+
+        # 4. 구조 점수 (최대 0.15)
+        score += self._score_structure(candidate, hint)
+
+        # 5. 섹션 관련성 점수 (최대 0.2)
+        score += self._score_section_relevance(candidate, hint)
+
+        return min(1.0, score)
+
+    def _score_length(self, candidate: ChunkCandidate) -> float:
+        """길이 점수"""
+        length = len(candidate.text)
+
+        if 100 <= length <= 3000:
+            return 0.2
+        elif 50 <= length < 100:
+            return 0.1
+        elif length > 3000:
+            return 0.15
+        else:
+            return 0.0
+
+    def _score_keywords(
+        self,
+        candidate: ChunkCandidate,
+        spec: SpecItem,
+        hint: ExtractionHint
+    ) -> float:
+        """키워드 점수"""
+        score = 0.0
+        text_upper = candidate.text.upper()
+
+        # Spec name
+        if spec.spec_name.upper() in text_upper:
+            score += 0.15
+
+        # Equipment
+        if spec.equipment and spec.equipment.upper() in text_upper:
+            score += 0.1
+
+        # 동의어
+        if hint and hint.pos_umgv_desc:
+            if hint.pos_umgv_desc.upper() in text_upper:
+                score += 0.05
+
+        return score
+
+    def _score_numeric_pattern(
+        self,
+        candidate: ChunkCandidate,
+        spec: SpecItem,
+        hint: ExtractionHint
+    ) -> float:
+        """숫자 패턴 점수"""
+        value_format = hint.value_format if hint else ""
+        is_numeric = is_numeric_spec(spec.spec_name, value_format)
+
+        has_number = re.search(r'\d', candidate.text)
+
+        if is_numeric:
+            return 0.15 if has_number else 0.0
+        else:
+            return 0.1
+
+    def _score_structure(
+        self,
+        candidate: ChunkCandidate,
+        hint: ExtractionHint
+    ) -> float:
+        """구조 점수"""
+        score = 0.0
+
+        if candidate.is_table:
+            score += 0.1
+
+            # table_text hint와 일치
+            if hint and hint.table_text and hint.table_text.upper() == "Y":
+                score += 0.05
+
+        return score
+
+    def _score_section_relevance(
+        self,
+        candidate: ChunkCandidate,
+        hint: ExtractionHint
+    ) -> float:
+        """섹션 관련성 점수"""
+        score = 0.0
+        section_num = candidate.section_num
+
+        # Section 2 가산점
+        if section_num and section_num.startswith('2'):
+            score += 0.15
+
+        # Section 1 감점
+        if section_num and section_num.startswith('1'):
+            score -= 0.1
+
+        # Hint section 일치
+        if hint and hint.section_num:
+            hint_section = hint.section_num.split()[0]
+            if section_num and section_num in hint_section:
+                score += 0.05
+
+        return max(0.0, score)
+
+
+class LLMChunkSelector:
+    """
+    LLM 기반 최적 chunk 선택 (v53 신규)
+
+    Top N 후보 중 LLM이 가장 관련성 높은 chunk 선택
+    """
+
+    def __init__(
+        self,
+        llm_client: 'UnifiedLLMClient',
+        logger: logging.Logger = None
+    ):
+        self.llm_client = llm_client
+        self.log = logger or logging.getLogger(__name__)
+
+    def select_best_chunk(
+        self,
+        candidates: List[ChunkCandidate],
+        spec: SpecItem,
+        hint: ExtractionHint = None,
+        top_k: int = 5
+    ) -> Optional[ChunkCandidate]:
+        """
+        최적 chunk 선택
+
+        Args:
+            candidates: 후보 리스트 (이미 quality score로 정렬됨)
+            spec: 추출 대상 사양
+            hint: 참조 힌트
+            top_k: LLM에 제시할 후보 수
+
+        Returns:
+            선택된 chunk (없으면 None)
+        """
+        if not candidates:
+            return None
+
+        # 후보가 1개면 그대로 반환
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Top K만 선택
+        top_candidates = candidates[:top_k]
+
+        # 프롬프트 생성
+        prompt = self._build_selection_prompt(top_candidates, spec, hint)
+
+        # LLM 호출
+        try:
+            response = self.llm_client.generate(prompt)
+            selected_idx = self._parse_selection_response(response, len(top_candidates))
+
+            if selected_idx is not None and 0 <= selected_idx < len(top_candidates):
+                selected = top_candidates[selected_idx]
+                self.log.debug(
+                    "LLM selected chunk %d: source=%s, score=%.2f",
+                    selected_idx, selected.source, selected.quality_score
+                )
+                return selected
+            else:
+                # 파싱 실패 시 최고 점수 후보 반환
+                self.log.debug("LLM selection parse failed, using top score")
+                return top_candidates[0]
+
+        except Exception as e:
+            self.log.debug("LLM selection error: %s, using top score", e)
+            return top_candidates[0]
+
+    def _build_selection_prompt(
+        self,
+        candidates: List[ChunkCandidate],
+        spec: SpecItem,
+        hint: ExtractionHint
+    ) -> str:
+        """선택 프롬프트 생성"""
+
+        # 후보 목록 구성
+        candidate_list = []
+        for idx, cand in enumerate(candidates):
+            preview = cand.text[:200] + "..." if len(cand.text) > 200 else cand.text
+            candidate_list.append(
+                f"[{idx}] (Section: {cand.section_num}, Source: {cand.source})\n{preview}\n"
+            )
+
+        candidates_text = "\n".join(candidate_list)
+
+        # 힌트 정보
+        hint_text = ""
+        if hint:
+            hint_parts = []
+            if hint.historical_values:
+                hint_parts.append(f"과거값 예시: {', '.join(hint.historical_values[:2])}")
+            if hint.pos_umgv_desc:
+                hint_parts.append(f"다른이름: {hint.pos_umgv_desc}")
+            if hint.section_num:
+                hint_parts.append(f"예상 섹션: {hint.section_num}")
+
+            if hint_parts:
+                hint_text = "\n힌트: " + ", ".join(hint_parts)
+
+        prompt = f"""당신은 POS 문서에서 사양값을 추출하는 전문가입니다.
+아래의 후보 chunk 중에서 "{spec.spec_name}" 사양값을 추출하기에 가장 적합한 chunk를 선택하세요.
+
+**추출 대상:**
+- 사양명: {spec.spec_name}
+- 장비: {spec.equipment or '미지정'}
+- 예상단위: {spec.expected_unit or '미지정'}{hint_text}
+
+**후보 Chunks:**
+{candidates_text}
+
+**작업:**
+위 후보 중 "{spec.spec_name}" 값을 추출하기에 가장 적합한 chunk의 번호를 선택하세요.
+주의: Section 2 (TECHNICAL PARTICULARS)의 chunk가 일반적으로 가장 정확합니다.
+
+**출력 형식:**
+정확히 다음 형식으로만 응답하세요:
+SELECTED: [번호]
+CONFIDENCE: [0.0-1.0]
+
+예:
+SELECTED: 2
+CONFIDENCE: 0.9"""
+
+        return prompt
+
+    def _parse_selection_response(
+        self,
+        response: str,
+        num_candidates: int
+    ) -> Optional[int]:
+        """LLM 응답 파싱"""
+        # "SELECTED: 2" 패턴 찾기
+        match = re.search(r'SELECTED:\s*(\d+)', response, re.IGNORECASE)
+        if match:
+            idx = int(match.group(1))
+            if 0 <= idx < num_candidates:
+                return idx
+
+        return None
+
+
+class ChunkExpander:
+    """
+    짧은 chunk를 주변 컨텍스트로 확장 (v53 신규)
+
+    전략:
+    1. 길이 < 100 chars이면 확장
+    2. 테이블 chunk: 전체 테이블 포함
+    3. 텍스트 chunk: ±500 chars 추가
+    """
+
+    def __init__(
+        self,
+        section_parser: HTMLSectionParser,
+        chunk_parser: HTMLChunkParser,
+        logger: logging.Logger = None
+    ):
+        self.section_parser = section_parser
+        self.chunk_parser = chunk_parser
+        self.log = logger or logging.getLogger(__name__)
+
+    def expand_if_needed(
+        self,
+        chunk: str,
+        candidate: ChunkCandidate,
+        max_size: int = 5000
+    ) -> str:
+        """
+        필요시 chunk 확장
+
+        Args:
+            chunk: 원본 chunk 텍스트
+            candidate: Chunk 후보 정보
+            max_size: 최대 크기
+
+        Returns:
+            확장된 chunk (또는 원본)
+        """
+        # 이미 충분히 긴 경우
+        if len(chunk) >= 100:
+            return chunk
+
+        self.log.debug(
+            "Expanding short chunk (%d chars) from %s",
+            len(chunk), candidate.source
+        )
+
+        # 섹션 컨텐츠에서 주변 확장
+        section = self.section_parser.get_section_by_number(candidate.section_num)
+        if section:
+            # chunk가 섹션 내 어디 있는지 찾기
+            pos = section.content.find(chunk)
+            if pos >= 0:
+                # ±500 chars 확장
+                start = max(0, pos - 500)
+                end = min(len(section.content), pos + len(chunk) + 500)
+                expanded = section.content[start:end]
+
+                # 크기 제한
+                if len(expanded) > max_size:
+                    expanded = expanded[:max_size] + "...[truncated]"
+
+                self.log.debug("Expanded to %d chars", len(expanded))
+                return expanded
+
+        # 확장 실패 시 원본 반환
+        return chunk
+
+
+# =============================================================================
 # Rule 기반 추출기 (개선)
 # =============================================================================
 
@@ -3676,79 +4442,292 @@ class RuleBasedExtractor:
     """
     
     def __init__(
-        self, 
-        glossary: LightweightGlossaryIndex = None, 
+        self,
+        glossary: LightweightGlossaryIndex = None,
         specdb: LightweightSpecDBIndex = None,
-        hint_engine: ReferenceHintEngine = None
+        hint_engine: ReferenceHintEngine = None,
+        logger: logging.Logger = None,
+        enable_enhanced_chunk_selection: bool = True
     ):
         self.glossary = glossary
         self.specdb = specdb
         self.hint_engine = hint_engine
-        
+        self.log = logger or logging.getLogger(__name__)
+        self.enable_enhanced_chunk_selection = enable_enhanced_chunk_selection
+
         # 힌트 엔진이 없으면 생성 (lazy initialization)
         if not self.hint_engine and (glossary or specdb):
             self.hint_engine = ReferenceHintEngine(
                 glossary=glossary,
                 specdb=specdb
             )
+
+        # v53 Enhanced Chunk Selection 컴포넌트 (lazy loading)
+        self.section_parser = None
+        self.candidate_generator = None
+        self.quality_scorer = None
+        self.chunk_expander = None
+        self._enhanced_components_initialized = False
     
+    def _init_enhanced_components(self, parser: HTMLChunkParser):
+        """
+        Enhanced chunk selection 컴포넌트 초기화 (lazy loading)
+
+        Args:
+            parser: HTML 파서 (section parser 생성에 필요)
+        """
+        if self._enhanced_components_initialized:
+            return
+
+        try:
+            # HTMLSectionParser 생성
+            self.section_parser = HTMLSectionParser(
+                html_content=parser.html_content,
+                file_path=parser.file_path,
+                chunk_parser=parser
+            )
+
+            # ChunkCandidateGenerator 생성
+            self.candidate_generator = ChunkCandidateGenerator(
+                section_parser=self.section_parser,
+                chunk_parser=parser,
+                glossary=self.glossary,
+                logger=self.log
+            )
+
+            # ChunkQualityScorer 생성
+            self.quality_scorer = ChunkQualityScorer(
+                glossary=self.glossary,
+                logger=self.log
+            )
+
+            # ChunkExpander 생성
+            self.chunk_expander = ChunkExpander(
+                section_parser=self.section_parser,
+                chunk_parser=parser,
+                logger=self.log
+            )
+
+            self._enhanced_components_initialized = True
+            self.log.debug("Enhanced chunk selection components initialized")
+
+        except Exception as e:
+            self.log.warning(f"Failed to initialize enhanced components: {e}")
+            self.enable_enhanced_chunk_selection = False
+
     def preload_hints_for_hull(self, hull: str):
         """
         특정 hull의 힌트 정보를 배치 로드 (효율성 최적화)
-        
+
         파일 처리 시작 전 호출하면 이후 개별 추출이 빨라집니다.
-        
+
         Args:
             hull: 호선 번호
         """
         if self.hint_engine:
             self.hint_engine.preload_for_hull(hull)
     
+    def _extract_with_enhanced_selection(
+        self,
+        parser: HTMLChunkParser,
+        spec: SpecItem,
+        hint: ExtractionHint = None
+    ) -> Optional[ExtractionResult]:
+        """
+        Enhanced 4-stage chunk selection으로 추출 시도 (v53)
+
+        4 Stages:
+        1. HTMLSectionParser: 섹션 구조 파싱
+        2. ChunkCandidateGenerator: 다양한 소스에서 후보 생성
+        3. ChunkQualityScorer: 각 후보 품질 평가
+        4. ChunkExpander: 짧은 chunk 확장
+
+        Returns:
+            ExtractionResult 또는 None (실패 시)
+        """
+        try:
+            # 컴포넌트 초기화 (lazy)
+            self._init_enhanced_components(parser)
+
+            if not self._enhanced_components_initialized:
+                return None
+
+            # Stage 1-2: 후보 생성
+            candidates = self.candidate_generator.generate_candidates(spec, hint, max_candidates=10)
+
+            if not candidates:
+                self.log.debug(f"No chunk candidates for spec={spec.spec_name}")
+                return None
+
+            # Stage 3: 품질 평가
+            for candidate in candidates:
+                candidate.quality_score = self.quality_scorer.score_candidate(
+                    candidate, spec, hint
+                )
+
+            # 점수순 정렬
+            candidates.sort(key=lambda c: c.quality_score, reverse=True)
+
+            # 최고 점수 chunk 선택
+            best_candidate = candidates[0]
+
+            self.log.debug(
+                f"Best chunk: source={best_candidate.source}, "
+                f"section={best_candidate.section_num}, score={best_candidate.quality_score:.2f}"
+            )
+
+            # 점수가 너무 낮으면 실패
+            if best_candidate.quality_score < 0.3:
+                self.log.debug(f"Quality score too low: {best_candidate.quality_score:.2f}")
+                return None
+
+            # Stage 4: 필요시 확장
+            chunk_text = self.chunk_expander.expand_if_needed(
+                best_candidate.text, best_candidate, max_size=3000
+            )
+
+            # 값 추출 시도 (chunk에서 직접 추출)
+            value, unit = self._extract_value_from_chunk(chunk_text, spec, hint)
+
+            if value:
+                confidence = best_candidate.quality_score * 0.9  # quality score 기반
+                return ExtractionResult(
+                    spec_item=spec,
+                    value=value,
+                    unit=unit or spec.expected_unit,
+                    chunk=chunk_text[:500],  # 500자 제한
+                    method="RULE_ENHANCED_CHUNK",
+                    confidence=confidence,
+                    reference_source=f"enhanced:{best_candidate.source}"
+                )
+
+            return None
+
+        except Exception as e:
+            self.log.warning(f"Enhanced chunk selection error: {e}")
+            return None
+
+    def _extract_value_from_chunk(
+        self,
+        chunk: str,
+        spec: SpecItem,
+        hint: ExtractionHint = None
+    ) -> Tuple[str, str]:
+        """
+        Chunk에서 값 추출 (간단한 패턴 매칭)
+
+        Returns:
+            (value, unit) 튜플
+        """
+        # 사양명 뒤의 값 찾기
+        spec_upper = spec.spec_name.upper()
+        chunk_upper = chunk.upper()
+
+        # 패턴 1: "SPEC_NAME : VALUE"
+        pattern = rf'{re.escape(spec_upper)}\s*[:：]\s*([^\n\|]+)'
+        match = re.search(pattern, chunk_upper, re.IGNORECASE)
+
+        if match:
+            raw_value = match.group(1).strip()
+            # 값과 단위 분리
+            value, unit = self._parse_value_unit(raw_value)
+            if value:
+                return value, unit
+
+        # 패턴 2: 테이블 구조 "SPEC_NAME | VALUE"
+        pattern2 = rf'{re.escape(spec_upper)}\s*\|\s*([^\n\|]+)'
+        match2 = re.search(pattern2, chunk_upper, re.IGNORECASE)
+
+        if match2:
+            raw_value = match2.group(1).strip()
+            value, unit = self._parse_value_unit(raw_value)
+            if value:
+                return value, unit
+
+        # 패턴 3: "SPEC_NAME<whitespace>VALUE" (단위 포함 값)
+        pattern3 = rf'{re.escape(spec_upper)}\s+([0-9.,\-~]+\s*[a-zA-Z°℃%/]+)'
+        match3 = re.search(pattern3, chunk_upper, re.IGNORECASE)
+
+        if match3:
+            raw_value = match3.group(1).strip()
+            value, unit = self._parse_value_unit(raw_value)
+            if value:
+                return value, unit
+
+        return "", ""
+
+    def _parse_value_unit(self, raw_value: str) -> Tuple[str, str]:
+        """
+        값과 단위 분리
+
+        Returns:
+            (value, unit) 튜플
+        """
+        if not raw_value:
+            return "", ""
+
+        raw_value = raw_value.strip()
+
+        # 숫자+단위 패턴
+        match = re.match(r'^([0-9.,\-~\s]+)\s*([a-zA-Z°℃%/]+.*)?$', raw_value)
+        if match:
+            value = match.group(1).strip()
+            unit = match.group(2).strip() if match.group(2) else ""
+            return value, unit
+
+        # 순수 숫자
+        if re.match(r'^[0-9.,\-~\s]+$', raw_value):
+            return raw_value.strip(), ""
+
+        # 텍스트 값 (숫자 없음)
+        return raw_value, ""
+
     def _get_spec_name_variants(self, spec_name: str, hint: ExtractionHint = None) -> List[str]:
         """
         사양명의 모든 변형 반환 (동의어 포함)
-        
+
         용어집의 umgv_desc ↔ pos_umgv_desc 매핑을 활용하여
         검색할 사양명 후보를 확장합니다.
-        
+
         Args:
             spec_name: 원본 사양명
             hint: 추출 힌트 (있으면 pos_umgv_desc 추가)
-            
+
         Returns:
             검색할 사양명 리스트 (원본 + 동의어들)
         """
         variants = [spec_name]
-        
+
         # 힌트에서 pos_umgv_desc 추가
         if hint and hint.pos_umgv_desc and hint.pos_umgv_desc not in variants:
             variants.append(hint.pos_umgv_desc)
-        
+
         # 용어집에서 동의어 조회
         if self.glossary and hasattr(self.glossary, 'get_synonyms'):
             synonyms = self.glossary.get_synonyms(spec_name)
             for syn in synonyms:
                 if syn and syn not in variants:
                     variants.append(syn)
-        
+
         return variants
     
     def extract(
-        self, 
-        parser: HTMLChunkParser, 
+        self,
+        parser: HTMLChunkParser,
         spec: SpecItem,
         hint: ExtractionHint = None
     ) -> Optional[ExtractionResult]:
         """
-        테이블에서 사양값 추출 (다중 전략 + 힌트 활용)
-        
+        테이블에서 사양값 추출 (v53: Enhanced chunk selection 통합)
+
         전략 순서:
+        0. [v53 NEW] Enhanced 4-stage chunk selection
         1. [힌트] 섹션 힌트 기반 검색 (section_num 활용)
         2. 표준 사양명으로 테이블 검색
         3. 동의어로 테이블 검색 (용어집 활용)
         4. 키워드 기반 텍스트 검색
         5. [힌트] 과거 값 형식으로 재검색
-        
+
         Args:
             parser: HTML 파서
             spec: 추출 대상 사양 정보
@@ -3757,7 +4736,14 @@ class RuleBasedExtractor:
         # 힌트 조회 (없으면 동적 조회)
         if not hint and self.hint_engine and spec.hull:
             hint = self.hint_engine.get_hints(spec.hull, spec.spec_name)
-        
+
+        # v53: Enhanced chunk selection 시도
+        if self.enable_enhanced_chunk_selection:
+            enhanced_result = self._extract_with_enhanced_selection(parser, spec, hint)
+            if enhanced_result:
+                return enhanced_result
+
+        # 기존 로직 (fallback)
         # 사양명 변형 목록 (동의어 + 힌트의 pos_umgv_desc)
         spec_variants = self._get_spec_name_variants(spec.spec_name, hint)
         
@@ -4285,7 +5271,9 @@ class LLMFallbackExtractor:
         timeout: int = 120,
         logger: logging.Logger = None,
         llm_client: 'UnifiedLLMClient' = None,
-        use_voting: bool = True
+        use_voting: bool = True,
+        glossary: LightweightGlossaryIndex = None,
+        enable_enhanced_chunk_selection: bool = True
     ):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
@@ -4295,12 +5283,75 @@ class LLMFallbackExtractor:
         self._current_port_idx = 0
         self.llm_client = llm_client  # UnifiedLLMClient for voting support
         self.use_voting = use_voting  # Enable voting for improved accuracy
+        self.glossary = glossary
+        self.enable_enhanced_chunk_selection = enable_enhanced_chunk_selection
+
+        # v53 Enhanced Chunk Selection 컴포넌트 (lazy loading)
+        self.section_parser = None
+        self.candidate_generator = None
+        self.quality_scorer = None
+        self.llm_chunk_selector = None  # LLM 기반 chunk 선택
+        self.chunk_expander = None
+        self._enhanced_components_initialized = False
     
+    def _init_enhanced_components(self, parser: HTMLChunkParser):
+        """
+        Enhanced chunk selection 컴포넌트 초기화 (lazy loading)
+
+        Args:
+            parser: HTML 파서
+        """
+        if self._enhanced_components_initialized:
+            return
+
+        try:
+            # HTMLSectionParser 생성
+            self.section_parser = HTMLSectionParser(
+                html_content=parser.html_content,
+                file_path=parser.file_path,
+                chunk_parser=parser
+            )
+
+            # ChunkCandidateGenerator 생성
+            self.candidate_generator = ChunkCandidateGenerator(
+                section_parser=self.section_parser,
+                chunk_parser=parser,
+                glossary=self.glossary,
+                logger=self.log
+            )
+
+            # ChunkQualityScorer 생성
+            self.quality_scorer = ChunkQualityScorer(
+                glossary=self.glossary,
+                logger=self.log
+            )
+
+            # LLMChunkSelector 생성 (LLM 기반 선택)
+            if self.llm_client:
+                self.llm_chunk_selector = LLMChunkSelector(
+                    llm_client=self.llm_client,
+                    logger=self.log
+                )
+
+            # ChunkExpander 생성
+            self.chunk_expander = ChunkExpander(
+                section_parser=self.section_parser,
+                chunk_parser=parser,
+                logger=self.log
+            )
+
+            self._enhanced_components_initialized = True
+            self.log.debug("LLM Fallback: Enhanced chunk selection components initialized")
+
+        except Exception as e:
+            self.log.warning(f"Failed to initialize enhanced components: {e}")
+            self.enable_enhanced_chunk_selection = False
+
     def _get_ollama_url(self) -> str:
         """현재 Ollama URL 반환"""
         port = self.ports[self._current_port_idx % len(self.ports)]
         return f"http://{self.host}:{port}/api/generate"
-    
+
     def _rotate_port(self):
         """다음 포트로 전환"""
         self._current_port_idx = (self._current_port_idx + 1) % len(self.ports)
@@ -4313,24 +5364,30 @@ class LLMFallbackExtractor:
         max_chunk_chars: int = 5000
     ) -> Optional[ExtractionResult]:
         """
-        LLM으로 사양값 추출 (v52.4 디버그 강화)
-        
+        LLM으로 사양값 추출 (v53: Enhanced chunk selection 통합)
+
         Args:
             parser: HTML 파서
             spec: 추출할 사양 항목
             hint: 참조 힌트 (용어집/사양값DB)
             max_chunk_chars: 최대 청크 크기
-            
+
         Returns:
             ExtractionResult 또는 None
         """
         if not HAS_REQUESTS:
             self.log.warning("requests 모듈 없음. LLM Fallback 비활성화")
             return None
-        
-        # 관련 청크 추출 (힌트의 section_num 활용)
-        chunk = self._get_relevant_chunk(parser, spec, max_chunk_chars, hint)
-        
+
+        # v53: Enhanced chunk selection 시도
+        chunk = None
+        if self.enable_enhanced_chunk_selection:
+            chunk = self._get_enhanced_chunk(parser, spec, hint, max_chunk_chars)
+
+        # Fallback to legacy chunk selection
+        if not chunk:
+            chunk = self._get_relevant_chunk(parser, spec, max_chunk_chars, hint)
+
         if not chunk:
             self.log.debug("LLM Fallback 스킵: 관련 청크 없음 (spec=%s)", spec.spec_name)
             return None
@@ -4561,16 +5618,91 @@ class LLMFallbackExtractor:
 
         return results
 
+    def _get_enhanced_chunk(
+        self,
+        parser: HTMLChunkParser,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        max_chars: int
+    ) -> str:
+        """
+        Enhanced 4-stage chunk selection으로 chunk 추출 (v53)
+
+        4 Stages:
+        1. HTMLSectionParser: 섹션 구조 파싱
+        2. ChunkCandidateGenerator: 다양한 소스에서 후보 생성
+        3. ChunkQualityScorer + LLMChunkSelector: 최적 chunk 선택
+        4. ChunkExpander: 짧은 chunk 확장
+
+        Returns:
+            최적 chunk 텍스트 (없으면 빈 문자열)
+        """
+        try:
+            # 컴포넌트 초기화 (lazy)
+            self._init_enhanced_components(parser)
+
+            if not self._enhanced_components_initialized:
+                return ""
+
+            # Stage 1-2: 후보 생성
+            candidates = self.candidate_generator.generate_candidates(spec, hint, max_candidates=10)
+
+            if not candidates:
+                self.log.debug(f"No chunk candidates for LLM (spec={spec.spec_name})")
+                return ""
+
+            # Stage 3: 품질 평가
+            for candidate in candidates:
+                candidate.quality_score = self.quality_scorer.score_candidate(
+                    candidate, spec, hint
+                )
+
+            # 점수순 정렬
+            candidates.sort(key=lambda c: c.quality_score, reverse=True)
+
+            # Stage 3b: LLM 기반 최적 chunk 선택 (Top 5 중에서)
+            best_candidate = None
+            if self.llm_chunk_selector:
+                self.log.debug(f"Using LLM chunk selector for {spec.spec_name}")
+                best_candidate = self.llm_chunk_selector.select_best_chunk(
+                    candidates, spec, hint, top_k=5
+                )
+
+            # LLM 선택 실패 시 최고 점수 사용
+            if not best_candidate:
+                best_candidate = candidates[0]
+
+            self.log.debug(
+                f"Selected chunk: source={best_candidate.source}, "
+                f"section={best_candidate.section_num}, score={best_candidate.quality_score:.2f}"
+            )
+
+            # 점수가 너무 낮으면 실패
+            if best_candidate.quality_score < 0.2:
+                self.log.debug(f"Quality score too low: {best_candidate.quality_score:.2f}")
+                return ""
+
+            # Stage 4: 필요시 확장
+            chunk_text = self.chunk_expander.expand_if_needed(
+                best_candidate.text, best_candidate, max_size=max_chars
+            )
+
+            return chunk_text
+
+        except Exception as e:
+            self.log.warning(f"Enhanced chunk selection error: {e}")
+            return ""
+
     def _get_relevant_chunk(
-        self, 
-        parser: HTMLChunkParser, 
+        self,
+        parser: HTMLChunkParser,
         spec: SpecItem,
         max_chars: int,
         hint: ExtractionHint = None
     ) -> str:
         """
-        관련 청크 추출 (v52.4 개선 - 더 유연한 검색)
-        
+        관련 청크 추출 (v52.4 - Legacy fallback)
+
         개선사항:
         1. 힌트의 section_num으로 섹션 검색
         2. pos_umgv_desc (동의어)로도 검색
