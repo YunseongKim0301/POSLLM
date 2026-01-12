@@ -62,6 +62,15 @@ except ImportError:
     HAS_NUMPY = False
 
 try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # tqdm 없으면 dummy function 사용
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
@@ -397,6 +406,36 @@ def log_gpu_memory(logger: logging.Logger):
             f"({gpu['memory_used_mb']/gpu['memory_total_mb']*100:.1f}% used), "
             f"Util: {gpu['utilization_percent']:.0f}%"
         )
+
+
+def log_extraction_hint(logger: logging.Logger, spec_name: str, hint, source: str = ""):
+    """추출 시 사용된 힌트 정보 로깅 (v53)"""
+    if not hint:
+        logger.debug(f"[{source}] {spec_name}: 힌트 없음")
+        return
+
+    hint_info = []
+
+    if hasattr(hint, 'section_num') and hint.section_num:
+        hint_info.append(f"Section={hint.section_num[:30]}")
+
+    if hasattr(hint, 'historical_values') and hint.historical_values:
+        examples = ', '.join(hint.historical_values[:2])
+        hint_info.append(f"HistValues=[{examples}]")
+
+    if hasattr(hint, 'pos_umgv_desc') and hint.pos_umgv_desc:
+        hint_info.append(f"Synonym={hint.pos_umgv_desc}")
+
+    if hasattr(hint, 'table_text') and hint.table_text:
+        hint_info.append(f"TableText={hint.table_text}")
+
+    if hasattr(hint, 'value_format') and hint.value_format:
+        hint_info.append(f"Format={hint.value_format}")
+
+    if hint_info:
+        logger.debug(f"[{source}] {spec_name}: 힌트 활용 - {', '.join(hint_info)}")
+    else:
+        logger.debug(f"[{source}] {spec_name}: 힌트 객체 있으나 정보 없음")
 
 
 # =============================================================================
@@ -4543,24 +4582,57 @@ class ChunkQualityScorer:
         spec: SpecItem,
         hint: ExtractionHint
     ) -> float:
-        """키워드 점수 (v53: spec-specific 강화)"""
+        """키워드 점수 (v53: fuzzy matching 지원)"""
         score = 0.0
         text_upper = candidate.text.upper()
         spec_upper = spec.spec_name.upper()
 
-        # v53: Spec name이 정확히 있는지 체크 (부분 매칭이 아닌 단어 경계 체크)
-        # 예: "TEMPERATURE"가 "MAX. TEMPERATURE"에만 매칭되고 다른 TEMPERATURE에는 낮은 점수
+        # v53: Exact match
         if spec_upper in text_upper:
             score += 0.15
 
-            # 더 구체적인 매칭 (장비명도 함께 있으면 보너스)
+            # 장비명도 함께 있으면 보너스
             if spec.equipment and spec.equipment.upper() in text_upper:
-                score += 0.1  # 추가 보너스
+                score += 0.1
         else:
-            # Spec name이 없으면 매우 낮은 점수
-            return 0.0
+            # v53: Fuzzy matching - 약어 및 부분 단어 매칭
+            # 사양명을 단어로 분리 (예: "DIAMETER X LENGTH" → ["DIAMETER", "LENGTH"])
+            spec_words = [w for w in re.findall(r'[A-Z]{3,}', spec_upper) if len(w) >= 3]
 
-        # Equipment만 있고 spec name이 없는 경우는 이미 위에서 0.0 반환
+            if spec_words:
+                # 약어 매칭 (예: DIAMETER → DIA, TEMPERATURE → TEMP)
+                abbrev_patterns = {
+                    'DIAMETER': r'\bDIA\.?',
+                    'TEMPERATURE': r'\bTEMP\.?',
+                    'QUANTITY': r'\bQTY\.?',
+                    'MAXIMUM': r'\bMAX\.?',
+                    'MINIMUM': r'\bMIN\.?',
+                    'LENGTH': r'\bLEN\.?|LENGTH',
+                    'PRESSURE': r'\bPRES\.?|PRESS\.?',
+                }
+
+                matched = False
+                for word in spec_words:
+                    # Exact word match
+                    if re.search(rf'\b{word}\b', text_upper):
+                        matched = True
+                        break
+                    # Abbreviation match
+                    if word in abbrev_patterns:
+                        if re.search(abbrev_patterns[word], text_upper):
+                            matched = True
+                            break
+
+                if matched:
+                    score += 0.10  # Fuzzy match는 exact보다 낮은 점수
+
+                    # 여러 키워드 매칭 시 추가 점수
+                    matched_count = sum(1 for w in spec_words if re.search(rf'\b{w}\b', text_upper))
+                    if matched_count >= 2:
+                        score += 0.05
+                else:
+                    # 어떤 키워드도 매칭 안 되면 매우 낮은 점수
+                    return 0.02  # 완전히 0은 아니지만 매우 낮음
 
         # 동의어
         if hint and hint.pos_umgv_desc:
@@ -5162,6 +5234,9 @@ class RuleBasedExtractor:
         if not hint and self.hint_engine and spec.hull:
             hint = self.hint_engine.get_hints(spec.hull, spec.spec_name)
 
+        # v53: 힌트 로깅
+        log_extraction_hint(self.log, spec.spec_name, hint, source="RuleBasedExtractor")
+
         # v53: Enhanced chunk selection 시도
         if self.enable_enhanced_chunk_selection:
             enhanced_result = self._extract_with_enhanced_selection(parser, spec, hint)
@@ -5693,7 +5768,7 @@ class LLMFallbackExtractor:
         ollama_host: str = "127.0.0.1",
         ollama_ports: List[int] = None,
         model: str = "qwen2.5:32b",
-        timeout: int = 120,
+        timeout: int = 180,  # v53: 120 → 180 (timeout 빈번 발생)
         logger: logging.Logger = None,
         llm_client: 'UnifiedLLMClient' = None,
         use_voting: bool = True,
@@ -5804,6 +5879,9 @@ class LLMFallbackExtractor:
             self.log.warning("requests 모듈 없음. LLM Fallback 비활성화")
             return None
 
+        # v53: 힌트 로깅
+        log_extraction_hint(self.log, spec.spec_name, hint, source="LLMFallbackExtractor")
+
         # v53: Enhanced chunk selection 시도
         chunk = None
         if self.enable_enhanced_chunk_selection:
@@ -5830,7 +5908,7 @@ class LLMFallbackExtractor:
             try:
                 response, _, _ = self.llm_client.generate_with_voting(
                     prompt=prompt,
-                    vote_k=3,  # 3번 호출하여 투표
+                    vote_k=2,  # v53: 2번 호출 (성능 최적화, 2 ports × 1 = 2 votes)
                     min_agreement=2  # 2개 이상 일치 필요
                 )
             except Exception as e:
@@ -6192,8 +6270,22 @@ class LLMFallbackExtractor:
         if not chunks:
             full_text = parser.get_full_text()
             if full_text:
-                # 문서 앞부분 (보통 사양 정보가 있음)
-                chunks.append(f"[Document excerpt]\n{full_text[:3000]}")
+                # v53: GENERAL section은 절대 반환하지 않음
+                # Section 2 (TECHNICAL PARTICULARS)를 찾아서 반환
+                section2_match = re.search(r'2\.\s*TECHNICAL\s+PARTICULARS', full_text, re.IGNORECASE)
+                if section2_match:
+                    start = section2_match.start()
+                    # Section 3 또는 문서 끝까지
+                    section3_match = re.search(r'\n\s*3\.\s+[A-Z]', full_text[start:], re.IGNORECASE)
+                    if section3_match:
+                        end = min(start + section3_match.start(), start + 3000)
+                    else:
+                        end = min(start + 3000, len(full_text))
+                    chunks.append(f"[Section 2 excerpt]\n{full_text[start:end]}")
+                else:
+                    # Section 2도 없으면 아예 반환하지 않음 (GENERAL 반환 방지)
+                    self.log.debug("No Section 2 found, skipping fallback chunk")
+                    return ""  # 빈 문자열 반환
         
         # 청크 결합 및 크기 제한
         combined = '\n---\n'.join(chunks)
@@ -6263,12 +6355,14 @@ class LLMFallbackExtractor:
 ```
 
 주의사항:
-1. 값만 추출하고 사양명은 포함하지 마세요
-2. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
-3. 여러 값이 있으면 가장 관련성 높은 것을 선택하세요
-4. 확실하지 않으면 confidence를 낮게 설정하세요
-5. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
-6. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
+1. **필수**: 추출한 값이 위 문서에 정확히 존재하는지 확인하세요. 문서에 없는 값은 절대 만들지 마세요!
+2. 값만 추출하고 사양명은 포함하지 마세요
+3. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
+4. 괄호 안의 숫자도 확인하세요 (예: "(34)mm" → value: "34", unit: "mm")
+5. 여러 값이 있으면 "{spec.spec_name}"에 가장 관련성 높은 것을 선택하세요
+6. 확실하지 않거나 문서에 값이 명확히 없으면 빈 문자열 반환하세요
+7. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
+8. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
    - 대소문자, 띄어쓰기, 특수문자 등을 정확히 보존하세요
    - 예: POS에 "capacity"로 적혀있으면 "capacity", "CAPACITY"로 적혀있으면 "CAPACITY"
 """
@@ -6341,6 +6435,35 @@ class LLMFallbackExtractor:
 
             if not value:
                 return None
+
+            # v53: LLM 환각 방지 - 추출된 값이 chunk에 실제로 있는지 검증
+            chunk_upper = chunk.upper()
+            value_upper = value.upper()
+
+            # 숫자 값인 경우 더 엄격하게 검증
+            if re.match(r'^-?\d+\.?\d*$', value):  # 순수 숫자
+                # 괄호 포함 여부 확인 (예: (34), 34)
+                value_patterns = [
+                    rf'\b{re.escape(value)}\b',  # 정확한 숫자
+                    rf'\({re.escape(value)}\)',  # 괄호 안 숫자
+                    rf'{re.escape(value)}\s*[A-Za-z]',  # 숫자 + 단위
+                ]
+
+                found = any(re.search(pattern, chunk, re.IGNORECASE) for pattern in value_patterns)
+
+                if not found:
+                    self.log.warning(
+                        f"LLM 환각 감지: 추출값 '{value}'이(가) chunk에 없음. "
+                        f"Chunk 내용: {chunk[:200]}..."
+                    )
+                    # confidence를 크게 낮춤
+                    confidence *= 0.3
+            elif value_upper not in chunk_upper:
+                # 텍스트 값도 chunk에 있는지 확인
+                self.log.warning(
+                    f"LLM 환각 가능성: 추출값 '{value}'이(가) chunk에 정확히 없음"
+                )
+                confidence *= 0.5
 
             return ExtractionResult(
                 spec_item=spec,
@@ -8015,8 +8138,10 @@ class POSExtractorV52:
         
         # 추출 실행
         all_results = []
-        
-        for fname in pos_files:
+
+        # v53: tqdm 진행도 표시
+        total_specs = len(filtered_df)
+        for fname in tqdm(pos_files, desc="POS 파일 처리", unit="file"):
             html_path = os.path.join(pos_folder, fname)
             file_doknr = self.extract_doknr_from_filename(fname)
             
