@@ -356,16 +356,51 @@ def extract_numeric_value(text: str) -> Optional[float]:
     return None
 
 
-def is_numeric_spec(spec_name: str, value_format: str = "") -> bool:
-    """숫자형 사양인지 판단 (v2에서 추가)"""
+def is_numeric_spec(spec_name: str, value_format: str = "", confidence_level: bool = False) -> bool:
+    """
+    숫자형 사양인지 판단 (DB 기반 + 키워드 힌트)
+
+    우선순위:
+    1. value_format (용어집 DB) - 절대 규칙
+    2. numeric_keywords - 참조 힌트 (유연한 판단)
+
+    Args:
+        spec_name: 사양명
+        value_format: 용어집의 value_format 컬럼 (NUMERIC/TEXT/MIXED)
+        confidence_level: True이면 (is_numeric, confidence) 튜플 반환
+
+    Returns:
+        bool 또는 (bool, float) - confidence_level=True인 경우
+    """
+    # 1. value_format 우선 (DB 기반, 신뢰도 높음)
+    if value_format:
+        vf_upper = value_format.upper()
+        if vf_upper == "NUMERIC":
+            return (True, 1.0) if confidence_level else True
+        elif vf_upper == "TEXT":
+            return (False, 1.0) if confidence_level else False
+        elif vf_upper == "MIXED":
+            return (True, 0.7) if confidence_level else True  # Mixed는 부분적으로 숫자
+
+    # 2. 키워드 힌트 (참조용, 신뢰도 중간)
     numeric_keywords = [
         'capacity', 'head', 'power', 'pressure', 'temperature',
         'flow', 'speed', 'rpm', 'voltage', 'frequency', 'weight',
         'qty', 'quantity', 'no.', 'number', 'length', 'width', 'height',
-        'diameter', 'thickness', 'volume', 'area', 'mcr', 'ncr'
+        'diameter', 'thickness', 'volume', 'area', 'mcr', 'ncr',
+        'current', 'ampere', 'resistance', 'time', 'rate', 'efficiency'
     ]
+
     spec_lower = spec_name.lower()
-    return any(kw in spec_lower for kw in numeric_keywords)
+    keyword_match = any(kw in spec_lower for kw in numeric_keywords)
+
+    if confidence_level:
+        if keyword_match:
+            return (True, 0.6)  # 키워드 매칭: 중간 신뢰도
+        else:
+            return (False, 0.5)  # 불확실: 낮은 신뢰도
+    else:
+        return keyword_match
 
 
 def detect_checkbox_selection(text: str) -> Optional[str]:
@@ -3744,45 +3779,101 @@ class RuleBasedExtractor:
                                 confidence=confidence,
                                 reference_source=f"section:{hint.section_num}"
                             )
-        
-        # 전략 1: 테이블 검색 (모든 변형 시도)
-        for variant in spec_variants:
-            result = parser.find_value_in_tables(variant, spec.equipment)
-            
-            if result:
-                value, unit, chunk = result
-                if value:
-                    confidence = self._calculate_confidence(spec, value, unit, hint)
-                    # 동의어로 찾은 경우 약간 낮은 신뢰도
-                    if variant != spec.spec_name:
-                        confidence *= 0.95
-                    return ExtractionResult(
-                        spec_item=spec,
-                        value=value,
-                        unit=unit or spec.expected_unit,
-                        chunk=chunk,
-                        method="RULE_TABLE_DIRECT",
-                        confidence=confidence
-                    )
-        
-        # 전략 2: 키워드 기반 텍스트 검색 (모든 변형 시도)
-        for variant in spec_variants:
-            result = parser.find_value_by_keyword_search(variant, spec.equipment)
-            
-            if result:
-                value, unit, chunk = result
-                if value:
-                    confidence = self._calculate_confidence(spec, value, unit) * 0.9
-                    if variant != spec.spec_name:
-                        confidence *= 0.95
-                    return ExtractionResult(
-                        spec_item=spec,
-                        value=value,
-                        unit=unit or spec.expected_unit,
-                        chunk=chunk,
-                        method="RULE_KEYWORD_SEARCH",
-                        confidence=confidence
-                    )
+
+        # table_text 힌트에 따라 검색 우선순위 조정
+        # Y: 테이블 우선 검색, N: 텍스트 우선 검색
+        prefer_table = True
+        if hint and hint.table_text:
+            prefer_table = (hint.table_text.upper() == "Y")
+
+        # 전략 1a: 테이블 검색 (table_text=Y이거나 힌트 없음)
+        if prefer_table:
+            for variant in spec_variants:
+                result = parser.find_value_in_tables(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit, hint)
+                        # table_text 힌트와 일치하면 신뢰도 상승
+                        if hint and hint.table_text and hint.table_text.upper() == "Y":
+                            confidence *= 1.05  # 5% 보너스
+                        # 동의어로 찾은 경우 약간 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TABLE_DIRECT",
+                            confidence=confidence,
+                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                        )
+
+        # 전략 1b: 텍스트 검색 (table_text=N이면 우선)
+        if not prefer_table:
+            for variant in spec_variants:
+                result = parser.find_value_by_keyword_search(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit) * 0.9
+                        # table_text 힌트와 일치하면 신뢰도 상승
+                        if hint and hint.table_text and hint.table_text.upper() == "N":
+                            confidence *= 1.1  # 10% 보너스
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TEXT_SEARCH",
+                            confidence=confidence,
+                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                        )
+
+        # 전략 2: 반대 방향 검색 (테이블 우선이었으면 텍스트, 텍스트 우선이었으면 테이블)
+        if prefer_table:
+            # 테이블에서 못 찾았으면 텍스트 시도
+            for variant in spec_variants:
+                result = parser.find_value_by_keyword_search(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit) * 0.85  # 힌트 불일치로 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TEXT_FALLBACK",
+                            confidence=confidence
+                        )
+        else:
+            # 텍스트에서 못 찾았으면 테이블 시도
+            for variant in spec_variants:
+                result = parser.find_value_in_tables(variant, spec.equipment)
+
+                if result:
+                    value, unit, chunk = result
+                    if value:
+                        confidence = self._calculate_confidence(spec, value, unit, hint) * 0.85  # 힌트 불일치로 낮은 신뢰도
+                        if variant != spec.spec_name:
+                            confidence *= 0.95
+                        return ExtractionResult(
+                            spec_item=spec,
+                            value=value,
+                            unit=unit or spec.expected_unit,
+                            chunk=chunk,
+                            method="RULE_TABLE_FALLBACK",
+                            confidence=confidence
+                        )
         
         return None
     
