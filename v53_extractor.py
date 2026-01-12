@@ -690,6 +690,15 @@ class Config:
     split_compound_values: bool = True
     split_range_values: bool = True
 
+    # Full 모드 전용 설정
+    full_mode_batch_size: int = 15
+    full_mode_checkpoint_interval: int = 50
+    full_mode_voting_enabled: bool = True
+    full_mode_vote_k: int = 3
+    full_mode_audit_enabled: bool = True
+    full_mode_process_all_files: bool = True
+    full_mode_checkpoint_dir: str = ""
+
 
 def build_config() -> Config:
     """사용자 설정을 Config 객체로 변환"""
@@ -3970,12 +3979,183 @@ class UnifiedLLMClient:
 
         return "", 0, 0
 
+    def generate_with_voting(self, prompt: str, vote_k: int = 3, min_agreement: int = 2) -> Tuple[str, int, int]:
+        """
+        Voting 기능을 사용한 LLM 응답 생성
+
+        여러 번 호출하여 가장 많이 나온 응답 선택
+
+        Args:
+            prompt: 프롬프트
+            vote_k: 투표 횟수
+            min_agreement: 최소 일치 수
+
+        Returns:
+            (most_common_response, total_input_tokens, total_output_tokens)
+        """
+        if vote_k <= 1:
+            return self.generate(prompt)
+
+        responses = []
+        total_input = 0
+        total_output = 0
+
+        for i in range(vote_k):
+            text, in_tok, out_tok = self.generate(prompt)
+            if text:
+                responses.append(text)
+                total_input += in_tok
+                total_output += out_tok
+            else:
+                self.logger.warning(f"Voting 호출 {i+1}/{vote_k} 실패")
+
+        if not responses:
+            return "", 0, 0
+
+        # 가장 많이 나온 응답 선택
+        from collections import Counter
+        counter = Counter(responses)
+        most_common_response, count = counter.most_common(1)[0]
+
+        if count >= min_agreement:
+            self.logger.info(f"Voting 성공: {count}/{vote_k}개 일치")
+            return most_common_response, total_input, total_output
+        else:
+            self.logger.warning(f"Voting 합의 실패: 최대 {count}/{vote_k}개 일치 (최소 {min_agreement}개 필요)")
+            # 합의 실패 시 가장 많이 나온 것 반환
+            return most_common_response, total_input, total_output
+
     def get_stats(self) -> Dict:
         """통계 반환"""
         return {
             'total_calls': self.total_calls,
             'total_input_tokens': self.total_input_tokens,
             'total_output_tokens': self.total_output_tokens
+        }
+
+
+# =============================================================================
+# LLM 검증 클래스 (모든 추출 결과 검증)
+# =============================================================================
+
+class LLMValidator:
+    """
+    LLM을 사용한 추출 결과 검증
+
+    Rule-based 추출 결과도 LLM으로 검증하여 정확도 향상
+    """
+
+    def __init__(self, llm_client: UnifiedLLMClient, config: Config, logger: logging.Logger = None):
+        self.llm_client = llm_client
+        self.config = config
+        self.logger = logger or logging.getLogger("LLMValidator")
+
+    def validate_extraction(self, spec: SpecItem, extracted_value: str, extracted_unit: str,
+                           html_context: str, use_voting: bool = True) -> Dict[str, Any]:
+        """
+        추출된 값을 LLM으로 검증
+
+        Args:
+            spec: 사양 항목
+            extracted_value: 추출된 값
+            extracted_unit: 추출된 단위
+            html_context: HTML 컨텍스트 (테이블 등)
+            use_voting: Voting 사용 여부
+
+        Returns:
+            {
+                'is_valid': bool,  # 검증 통과 여부
+                'confidence': float,  # 신뢰도 (0-1)
+                'llm_extracted_value': str,  # LLM이 추출한 값 (다를 경우)
+                'llm_extracted_unit': str,  # LLM이 추출한 단위
+                'reason': str  # 검증 이유
+            }
+        """
+        prompt = self._build_validation_prompt(spec, extracted_value, extracted_unit, html_context)
+
+        if use_voting and self.config.vote_enabled:
+            response, _, _ = self.llm_client.generate_with_voting(
+                prompt,
+                vote_k=self.config.vote_k,
+                min_agreement=self.config.vote_min_agreement
+            )
+        else:
+            response, _, _ = self.llm_client.generate(prompt)
+
+        if not response:
+            self.logger.warning(f"LLM 검증 실패: spec={spec.spec_name}, 응답 없음")
+            return {
+                'is_valid': True,  # 검증 실패 시 통과로 간주 (보수적)
+                'confidence': 0.5,
+                'llm_extracted_value': extracted_value,
+                'llm_extracted_unit': extracted_unit,
+                'reason': 'LLM 응답 없음'
+            }
+
+        return self._parse_validation_response(response, extracted_value, extracted_unit)
+
+    def _build_validation_prompt(self, spec: SpecItem, extracted_value: str,
+                                 extracted_unit: str, html_context: str) -> str:
+        """검증 프롬프트 생성"""
+        prompt = f"""You are a technical specification validator.
+
+**Task**: Validate if the extracted value is correct for the given specification.
+
+**Specification Name**: {spec.spec_name}
+**Equipment**: {spec.equipment if spec.equipment else 'N/A'}
+**Expected Unit**: {spec.expected_unit if spec.expected_unit else 'N/A'}
+
+**Extracted Value**: {extracted_value}
+**Extracted Unit**: {extracted_unit}
+
+**HTML Context**:
+```
+{html_context[:2000]}
+```
+
+**Instructions**:
+1. Check if the extracted value matches the specification name in the context
+2. Check if the unit is appropriate
+3. Check if the value format is correct (number, text, etc.)
+
+**Output Format** (JSON):
+{{
+  "is_valid": true/false,
+  "confidence": 0.0-1.0,
+  "llm_extracted_value": "corrected value if different",
+  "llm_extracted_unit": "corrected unit if different",
+  "reason": "brief explanation"
+}}
+
+**Output**:"""
+
+        return prompt
+
+    def _parse_validation_response(self, response: str, original_value: str,
+                                   original_unit: str) -> Dict[str, Any]:
+        """LLM 검증 응답 파싱"""
+        try:
+            # JSON 추출 시도
+            json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group(0))
+                return {
+                    'is_valid': result.get('is_valid', True),
+                    'confidence': float(result.get('confidence', 0.7)),
+                    'llm_extracted_value': result.get('llm_extracted_value', original_value),
+                    'llm_extracted_unit': result.get('llm_extracted_unit', original_unit),
+                    'reason': result.get('reason', '')
+                }
+        except Exception as e:
+            self.logger.warning(f"LLM 검증 응답 파싱 실패: {e}, response={response[:200]}")
+
+        # 파싱 실패 시 기본값
+        return {
+            'is_valid': True,  # 보수적으로 통과
+            'confidence': 0.6,
+            'llm_extracted_value': original_value,
+            'llm_extracted_unit': original_unit,
+            'reason': '응답 파싱 실패'
         }
 
 
@@ -3996,7 +4176,9 @@ class LLMFallbackExtractor:
         ollama_ports: List[int] = None,
         model: str = "qwen2.5:32b",
         timeout: int = 120,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        llm_client: 'UnifiedLLMClient' = None,
+        use_voting: bool = True
     ):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
@@ -4004,6 +4186,8 @@ class LLMFallbackExtractor:
         self.timeout = timeout
         self.log = logger or logging.getLogger("LLMFallback")
         self._current_port_idx = 0
+        self.llm_client = llm_client  # UnifiedLLMClient for voting support
+        self.use_voting = use_voting  # Enable voting for improved accuracy
     
     def _get_ollama_url(self) -> str:
         """현재 Ollama URL 반환"""
@@ -4046,23 +4230,42 @@ class LLMFallbackExtractor:
         
         # 프롬프트 생성 (힌트 정보 포함)
         prompt = self._build_prompt(spec, chunk, hint)
-        
-        # LLM 호출
+
+        # LLM 호출 (Voting 사용 가능 시 정확도 향상)
         self.log.debug("LLM 호출 시작: spec=%s, chunk_len=%d", spec.spec_name, len(chunk))
-        response = self._call_ollama(prompt)
-        
+
+        response = None
+        if self.llm_client and self.use_voting:
+            # UnifiedLLMClient의 voting 기능 사용
+            self.log.info("LLM Fallback with Voting: spec=%s", spec.spec_name)
+            try:
+                response, _, _ = self.llm_client.generate_with_voting(
+                    prompt=prompt,
+                    vote_k=3,  # 3번 호출하여 투표
+                    min_agreement=2  # 2개 이상 일치 필요
+                )
+            except Exception as e:
+                self.log.warning("Voting 실패, 일반 호출로 fallback: %s", e)
+                response = self._call_ollama(prompt)
+        else:
+            # 기존 방식: 단일 호출
+            response = self._call_ollama(prompt)
+
         if response:
             result = self._parse_llm_response(response, spec, chunk)
             if result:
-                self.log.debug("LLM 응답 파싱 성공: spec=%s, value=%s", 
+                self.log.debug("LLM 응답 파싱 성공: spec=%s, value=%s",
                              spec.spec_name, result.value)
+                # Voting 사용 시 method 표시
+                if self.llm_client and self.use_voting:
+                    result.method = "llm_fallback_voting"
             else:
-                self.log.debug("LLM 응답 파싱 실패: spec=%s, response=%s...", 
+                self.log.debug("LLM 응답 파싱 실패: spec=%s, response=%s...",
                              spec.spec_name, response[:100] if response else "")
             return result
         else:
             self.log.debug("LLM 응답 없음: spec=%s", spec.spec_name)
-        
+
         return None
     
     def _get_relevant_chunk(
@@ -4329,7 +4532,29 @@ class POSExtractorV52:
         self.value_validator = ValueValidator(self.config)
         self.log.info("ValueValidator 초기화 완료")
 
-        # LLM Fallback 초기화
+        # UnifiedLLMClient 초기화 (모든 LLM 호출에 사용)
+        self.llm_client = None
+        self.llm_validator = None
+        if self.config.use_llm:
+            self.llm_client = UnifiedLLMClient(
+                ollama_host=self.config.ollama_host,
+                ollama_ports=self.config.ollama_ports,
+                model=self.config.ollama_model,
+                timeout=self.config.ollama_timeout,
+                temperature=self.config.llm_temperature,
+                max_retries=self.config.llm_max_retries,
+                retry_sleep=self.config.llm_retry_sleep_sec,
+                rate_limit=self.config.llm_rate_limit_sec,
+                logger=self.log
+            )
+            self.log.info("UnifiedLLMClient 초기화: %s (ports: %s)",
+                         self.config.ollama_model, self.config.ollama_ports)
+
+            # LLMValidator 초기화 (모든 추출 결과 검증)
+            self.llm_validator = LLMValidator(self.llm_client, self.config, self.log)
+            self.log.info("LLMValidator 초기화 완료 (모든 추출 결과 LLM 검증)")
+
+        # LLM Fallback 초기화 (UnifiedLLMClient와 연동하여 Voting 지원)
         self.llm_fallback = None
         if self.config.use_llm and self.config.enable_llm_fallback:
             self.llm_fallback = LLMFallbackExtractor(
@@ -4337,10 +4562,13 @@ class POSExtractorV52:
                 ollama_ports=self.config.ollama_ports,
                 model=self.config.ollama_model,
                 timeout=self.config.ollama_timeout,
-                logger=self.log
+                logger=self.log,
+                llm_client=self.llm_client,  # UnifiedLLMClient 전달
+                use_voting=self.config.vote_enabled  # Config의 voting 설정 사용
             )
-            self.log.info("LLM Fallback 초기화: %s (ports: %s)", 
-                         self.config.ollama_model, self.config.ollama_ports)
+            voting_status = "Voting 활성화" if self.config.vote_enabled else "단일 호출"
+            self.log.info("LLM Fallback 초기화: %s (ports: %s, %s)",
+                         self.config.ollama_model, self.config.ollama_ports, voting_status)
         
         # 통계
         self.stats = {
@@ -4586,13 +4814,59 @@ class POSExtractorV52:
                 spec.spec_name, result.value, result.unit,
                 chunk_context=chunk_context
             )
-            
+
             if not errors:
-                self.stats['rule_success'] += 1
-                return self._create_result(result, spec, html_path, hint)
+                # CRITICAL: 모든 추출 결과는 LLM 평가를 거쳐야 함
+                # Rule 기반 추출이 성공해도 LLM 검증 필수
+                if self.llm_validator:
+                    self.log.info("Rule 기반 추출 성공 → LLM 검증 시작: %s", spec.spec_name)
+
+                    # HTML 컨텍스트 준비 (최대 2000자)
+                    html_context = chunk_context if chunk_context else parser.get_context_for_value(result.value)
+                    if len(html_context) > 2000:
+                        html_context = html_context[:2000]
+
+                    # LLM 검증 (voting 활성화)
+                    validation = self.llm_validator.validate_extraction(
+                        spec=spec,
+                        extracted_value=result.value,
+                        extracted_unit=result.unit,
+                        html_context=html_context,
+                        use_voting=True  # Voting으로 정확도 향상
+                    )
+
+                    if validation['is_valid']:
+                        # LLM 검증 성공
+                        self.log.info("LLM 검증 성공: %s (confidence: %.2f)",
+                                    spec.spec_name, validation['confidence'])
+
+                        # LLM이 값을 수정한 경우 반영
+                        if validation['llm_extracted_value'] != result.value:
+                            self.log.info("LLM 값 보정: '%s' → '%s'",
+                                        result.value, validation['llm_extracted_value'])
+                            result.value = validation['llm_extracted_value']
+                            result.unit = validation['llm_extracted_unit']
+                            result.method = "rule+llm_corrected"
+                        else:
+                            result.method = "rule+llm_validated"
+
+                        result.confidence = validation['confidence']
+                        self.stats['rule_success'] += 1
+                        return self._create_result(result, spec, html_path, hint)
+                    else:
+                        # LLM이 Rule 결과를 거부 → LLM Fallback으로 진행
+                        self.log.warning("LLM이 Rule 결과 거부: %s (이유: %s)",
+                                       spec.spec_name, validation['reason'])
+                        self.log.info("LLM Fallback으로 재추출 시도")
+                        # 아래 LLM Fallback 섹션으로 진행
+                else:
+                    # LLMValidator가 없으면 Rule 결과 그대로 사용 (비권장)
+                    self.log.warning("LLMValidator 없음 - Rule 결과를 검증 없이 사용")
+                    self.stats['rule_success'] += 1
+                    return self._create_result(result, spec, html_path, hint)
             else:
                 # Pre-Check 실패 로그
-                self.log.debug("Pre-Check 실패: %s -> %s (errors: %s)", 
+                self.log.debug("Pre-Check 실패: %s -> %s (errors: %s)",
                              spec.spec_name, result.value, errors)
         
         # 2. LLM Fallback 시도 (힌트를 프롬프트에 포함)
@@ -4670,24 +4944,26 @@ class POSExtractorV52:
             'pmg_code': safe_get(raw, 'pmg_code'),
             'umg_desc': safe_get(raw, 'umg_desc'),
             'umg_code': safe_get(raw, 'umg_code'),
-            'mat_attr_desc': spec.equipment,
             'extwg': safe_get(raw, 'extwg'),
+            'extwg_desc': safe_get(raw, 'extwg_desc', spec.equipment),  # Required field
             'matnr': spec.matnr,
             'doknr': safe_get(raw, 'doknr'),
-            'umgv_desc': spec.spec_name,
             'umgv_code': spec.spec_code,
-            'umgv_uom': spec.expected_unit,
-            'file_name': os.path.basename(html_path) if html_path else '',
+            'umgv_desc': spec.spec_name,
             'section_num': section_num,
             'table_text': 'Y' if result.chunk else '',
             'value_format': self._detect_format(result.value),
+            'umgv_uom': spec.expected_unit,
+            'pos_chunk': result.chunk[:500] if result.chunk else '',
             'pos_extwg_desc': spec.equipment,
             'pos_umgv_desc': spec.spec_name,
             'pos_umgv_value': result.value,
             'umgv_value_edit': result.value,
             'pos_umgv_uom': result.unit,
-            'pos_chunk': result.chunk[:500] if result.chunk else '',
             'evidence_fb': '',
+            # Additional metadata fields (not in required spec but useful)
+            'file_name': os.path.basename(html_path) if html_path else '',
+            'mat_attr_desc': spec.equipment,
             '_method': result.method,
             '_confidence': result.confidence,
             '_evidence': result.evidence,
@@ -4697,34 +4973,305 @@ class POSExtractorV52:
     def _create_empty_result(self, spec: SpecItem, method: str) -> Dict[str, Any]:
         """빈 결과 생성"""
         raw = spec.raw_data or {}
-        
+
         return {
             'pmg_desc': safe_get(raw, 'pmg_desc'),
             'pmg_code': safe_get(raw, 'pmg_code'),
             'umg_desc': safe_get(raw, 'umg_desc'),
             'umg_code': safe_get(raw, 'umg_code'),
-            'mat_attr_desc': spec.equipment,
             'extwg': safe_get(raw, 'extwg'),
+            'extwg_desc': safe_get(raw, 'extwg_desc', ''),  # Required field
             'matnr': spec.matnr,
             'doknr': safe_get(raw, 'doknr'),
-            'umgv_desc': spec.spec_name,
             'umgv_code': spec.spec_code,
-            'umgv_uom': spec.expected_unit,
-            'file_name': '',
+            'umgv_desc': spec.spec_name,
             'section_num': '',
             'table_text': '',
             'value_format': '',
+            'umgv_uom': spec.expected_unit,
+            'pos_chunk': '',
             'pos_extwg_desc': '',
             'pos_umgv_desc': '',
             'pos_umgv_value': '',
             'umgv_value_edit': '',
             'pos_umgv_uom': '',
-            'pos_chunk': '',
             'evidence_fb': '',
+            # Additional metadata fields (not in required spec but useful)
+            'file_name': '',
+            'mat_attr_desc': spec.equipment,
             '_method': method,
             '_confidence': 0.0,
             '_evidence': '',
         }
+
+    def extract_full(
+        self,
+        html_folder: str = None,
+        checkpoint_file: str = None
+    ) -> Dict[str, Any]:
+        """
+        Full 모드: 디렉토리 내 모든 HTML 파일에 대해 일괄 추출
+
+        특징:
+        1. 자동 템플릿 로드 (DB의 ext_tmpl 테이블)
+        2. 배치 처리 및 체크포인트
+        3. Voting 활성화로 정확도 향상
+        4. 진행상황 및 상세 감사 로그
+
+        Args:
+            html_folder: HTML 파일이 있는 폴더 (없으면 config.light_mode_pos_folder 사용)
+            checkpoint_file: 체크포인트 파일 경로 (없으면 자동 생성)
+
+        Returns:
+            전체 추출 결과 딕셔너리
+        """
+        self.log.info("=" * 80)
+        self.log.info("Full 모드 추출 시작")
+        self.log.info("=" * 80)
+
+        # 폴더 설정
+        folder = html_folder or self.config.light_mode_pos_folder
+        if not folder or not os.path.exists(folder):
+            raise ValueError(f"HTML 폴더를 찾을 수 없습니다: {folder}")
+
+        # 체크포인트 파일 설정
+        if not checkpoint_file:
+            checkpoint_dir = self.config.full_mode_checkpoint_dir or self.config.output_path
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            checkpoint_file = os.path.join(checkpoint_dir, f"full_mode_checkpoint_{timestamp}.json")
+
+        # HTML 파일 목록 수집
+        html_files = []
+        for filename in sorted(os.listdir(folder)):
+            if filename.lower().endswith('.html'):
+                html_files.append(os.path.join(folder, filename))
+
+        self.log.info("총 %d개 HTML 파일 발견", len(html_files))
+
+        if not html_files:
+            self.log.warning("처리할 HTML 파일이 없습니다")
+            return {"status": "no_files", "total_files": 0, "results": []}
+
+        # 체크포인트 로드 (이전 실행 재개)
+        processed_files = set()
+        all_results = []
+        checkpoint_data = self._load_checkpoint(checkpoint_file)
+        if checkpoint_data:
+            processed_files = set(checkpoint_data.get('processed_files', []))
+            all_results = checkpoint_data.get('results', [])
+            self.log.info("체크포인트 로드: %d개 파일 이미 처리됨", len(processed_files))
+
+        # 파일별 처리
+        total_extracted = 0
+        total_failed = 0
+        batch_results = []
+
+        for idx, html_file in enumerate(html_files, 1):
+            if html_file in processed_files:
+                self.log.debug("스킵 (이미 처리됨): %s", os.path.basename(html_file))
+                continue
+
+            self.log.info("-" * 80)
+            self.log.info("[%d/%d] 처리 중: %s", idx, len(html_files), os.path.basename(html_file))
+            self.log.info("-" * 80)
+
+            try:
+                # 파일에 대한 템플릿 로드
+                file_specs = self._load_template_for_file(html_file)
+
+                if not file_specs:
+                    self.log.warning("템플릿 없음, 스킵: %s", os.path.basename(html_file))
+                    processed_files.add(html_file)
+                    continue
+
+                self.log.info("템플릿 로드 완료: %d개 사양 항목", len(file_specs))
+
+                # 힌트 배치 로드 (성능 최적화)
+                hull = self._extract_hull_from_filename(os.path.basename(html_file))
+                if hull:
+                    self.preload_hints_for_file(html_file, hull)
+
+                # 각 사양 항목 추출
+                file_results = []
+                for spec_idx, spec in enumerate(file_specs, 1):
+                    self.log.debug("  [%d/%d] 추출: %s", spec_idx, len(file_specs), spec.spec_name)
+
+                    result = self.extract_single(html_file, spec)
+                    file_results.append(result)
+
+                    if result.get('pos_umgv_value'):
+                        total_extracted += 1
+                    else:
+                        total_failed += 1
+
+                all_results.extend(file_results)
+                batch_results.extend(file_results)
+                processed_files.add(html_file)
+
+                self.log.info("파일 처리 완료: 추출 %d개 / 실패 %d개",
+                            len([r for r in file_results if r.get('pos_umgv_value')]),
+                            len([r for r in file_results if not r.get('pos_umgv_value')]))
+
+                # 체크포인트 저장 (주기적)
+                if self.config.enable_checkpoint and len(processed_files) % self.config.full_mode_checkpoint_interval == 0:
+                    self._save_checkpoint(checkpoint_file, list(processed_files), all_results)
+                    self.log.info("체크포인트 저장: %s", checkpoint_file)
+
+            except Exception as e:
+                self.log.error("파일 처리 실패: %s - %s", os.path.basename(html_file), e)
+                processed_files.add(html_file)  # 실패해도 스킵 처리
+                continue
+
+        # 최종 체크포인트 저장
+        if self.config.enable_checkpoint:
+            self._save_checkpoint(checkpoint_file, list(processed_files), all_results)
+            self.log.info("최종 체크포인트 저장: %s", checkpoint_file)
+
+        # 결과 요약
+        self.log.info("=" * 80)
+        self.log.info("Full 모드 추출 완료")
+        self.log.info("=" * 80)
+        self.log.info("처리 파일: %d / %d", len(processed_files), len(html_files))
+        self.log.info("추출 성공: %d", total_extracted)
+        self.log.info("추출 실패: %d", total_failed)
+
+        # 결과 저장
+        saved_files = self._save_full_mode_results(all_results)
+
+        return {
+            "status": "completed",
+            "mode": "full",
+            "total_files": len(html_files),
+            "processed_files": len(processed_files),
+            "total_specs": len(all_results),
+            "extracted": total_extracted,
+            "failed": total_failed,
+            "checkpoint_file": checkpoint_file,
+            "saved_files": saved_files,
+            "results": all_results
+        }
+
+    def _load_template_for_file(self, html_file: str) -> List[SpecItem]:
+        """
+        HTML 파일에 대한 템플릿(사양 항목 목록) 로드
+
+        DB 모드: ext_tmpl 테이블에서 로드
+        파일 모드: spec 파일에서 로드
+        """
+        if not self.pg_loader:
+            self.log.warning("PostgreSQL 연결 없음 - 템플릿 로드 불가")
+            return []
+
+        # 파일명에서 매칭 정보 추출
+        filename = os.path.basename(html_file)
+
+        # ext_tmpl 테이블에서 템플릿 로드
+        try:
+            tmpl_df = self.pg_loader.load_template_from_db()
+            if tmpl_df.empty:
+                self.log.error("템플릿 테이블(ext_tmpl)이 비어있습니다")
+                return []
+
+            # 파일명 기반 필터링 (doknr 매칭)
+            # 파일명 패턴: XXXX-POS-YYYYYYY...
+            # doknr에서 XXXX 또는 YYYYYYY 부분 매칭
+            hull = self._extract_hull_from_filename(filename)
+
+            # hull로 필터링
+            if hull:
+                filtered_df = tmpl_df[tmpl_df['doknr'].str.contains(hull, na=False, case=False)]
+            else:
+                # hull 없으면 전체 사용 (비권장)
+                filtered_df = tmpl_df
+
+            if filtered_df.empty:
+                self.log.error("템플릿 필터링 결과 없음: %s", filename)
+                return []
+
+            # SpecItem 객체 생성
+            specs = []
+            for _, row in filtered_df.iterrows():
+                spec = SpecItem(
+                    spec_name=row.get('umgv_desc', ''),
+                    spec_code=row.get('umgv_code', ''),
+                    equipment=row.get('pos_extwg_desc', ''),
+                    expected_unit=row.get('umgv_uom', ''),
+                    matnr=row.get('matnr', ''),
+                    hull=hull,
+                    raw_data=row.to_dict()
+                )
+                specs.append(spec)
+
+            return specs
+
+        except Exception as e:
+            self.log.error("템플릿 로드 실패: %s", e)
+            return []
+
+    def _load_checkpoint(self, checkpoint_file: str) -> Optional[Dict]:
+        """체크포인트 로드"""
+        if not os.path.exists(checkpoint_file):
+            return None
+
+        try:
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log.warning("체크포인트 로드 실패: %s", e)
+            return None
+
+    def _save_checkpoint(self, checkpoint_file: str, processed_files: List[str], results: List[Dict]):
+        """체크포인트 저장"""
+        try:
+            checkpoint_data = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "processed_files": processed_files,
+                "total_processed": len(processed_files),
+                "total_results": len(results),
+                "results": results
+            }
+
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+
+        except Exception as e:
+            self.log.error("체크포인트 저장 실패: %s", e)
+
+    def _save_full_mode_results(self, results: List[Dict]) -> Dict[str, str]:
+        """Full 모드 결과 저장 (JSON, CSV)"""
+        saved_files = {}
+
+        if not self.config.output_path:
+            self.log.warning("출력 경로 미설정 - 결과 저장 스킵")
+            return saved_files
+
+        os.makedirs(self.config.output_path, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        # JSON 저장
+        if self.config.save_json:
+            json_file = os.path.join(self.config.output_path, f"full_mode_results_{timestamp}.json")
+            try:
+                with open(json_file, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+                saved_files['json'] = json_file
+                self.log.info("JSON 저장 완료: %s", json_file)
+            except Exception as e:
+                self.log.error("JSON 저장 실패: %s", e)
+
+        # CSV 저장
+        if self.config.save_csv:
+            csv_file = os.path.join(self.config.output_path, f"full_mode_results_{timestamp}.csv")
+            try:
+                df = pd.DataFrame(results)
+                df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+                saved_files['csv'] = csv_file
+                self.log.info("CSV 저장 완료: %s", csv_file)
+            except Exception as e:
+                self.log.error("CSV 저장 실패: %s", e)
+
+        return saved_files
     
     def _detect_format(self, value: str) -> str:
         """값 형식 감지"""
