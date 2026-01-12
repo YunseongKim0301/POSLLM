@@ -129,6 +129,9 @@ LIGHT_MODE_BATCH_DISABLED = True
 # Light 모드에서 Hybrid glossary match 스킵 (초기화 시간 단축)
 LIGHT_MODE_SKIP_HYBRID_MATCH = True
 
+# Light 모드 병렬 처리 (v53 추가)
+LIGHT_MODE_WORKERS = 4  # 병렬 worker 수 (3-6 권장, 현재 27sec → 목표 5-10sec)
+
 # =============================================================================
 # [5] pos_embedding DB 활용 설정
 # =============================================================================
@@ -317,6 +320,83 @@ CSV_DEBUG_COLUMNS = [
     # 추출 근거
     "_evidence",
 ]
+
+
+# =============================================================================
+# GPU VRAM 모니터링 (v53 추가)
+# =============================================================================
+
+def get_gpu_memory_info() -> Dict[str, Any]:
+    """
+    nvidia-smi를 사용해 GPU VRAM 사용량 조회
+
+    Returns:
+        {
+            'available': True/False,
+            'gpus': [
+                {
+                    'id': 0,
+                    'name': 'GPU name',
+                    'memory_used_mb': 1024,
+                    'memory_total_mb': 40960,
+                    'memory_free_mb': 39936,
+                    'utilization_percent': 25
+                },
+                ...
+            ]
+        }
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,name,memory.used,memory.total,memory.free,utilization.gpu',
+             '--format=csv,noheader,nounits'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode != 0:
+            return {'available': False, 'gpus': [], 'error': 'nvidia-smi failed'}
+
+        gpus = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 6:
+                gpus.append({
+                    'id': int(parts[0]),
+                    'name': parts[1],
+                    'memory_used_mb': float(parts[2]),
+                    'memory_total_mb': float(parts[3]),
+                    'memory_free_mb': float(parts[4]),
+                    'utilization_percent': float(parts[5])
+                })
+
+        return {'available': True, 'gpus': gpus}
+
+    except FileNotFoundError:
+        return {'available': False, 'gpus': [], 'error': 'nvidia-smi not found'}
+    except Exception as e:
+        return {'available': False, 'gpus': [], 'error': str(e)}
+
+
+def log_gpu_memory(logger: logging.Logger):
+    """GPU VRAM 사용량을 로그에 출력"""
+    gpu_info = get_gpu_memory_info()
+
+    if not gpu_info['available']:
+        logger.debug(f"GPU 정보 없음: {gpu_info.get('error', 'unknown')}")
+        return
+
+    for gpu in gpu_info['gpus']:
+        logger.info(
+            f"GPU {gpu['id']} ({gpu['name']}): "
+            f"VRAM {gpu['memory_used_mb']:.0f}/{gpu['memory_total_mb']:.0f} MB "
+            f"({gpu['memory_used_mb']/gpu['memory_total_mb']*100:.1f}% used), "
+            f"Util: {gpu['utilization_percent']:.0f}%"
+        )
 
 
 # =============================================================================
@@ -928,6 +1008,7 @@ class Config:
     # Light 모드 최적화
     light_mode_batch_disabled: bool = True
     light_mode_skip_hybrid_match: bool = True
+    light_mode_workers: int = 4  # v53: 병렬 worker 수 (3-6 권장)
 
     # 값 검증 설정 (v2에서 추가)
     enable_value_validation: bool = True
@@ -1032,6 +1113,7 @@ def build_config() -> Config:
         # Light 모드 최적화
         light_mode_batch_disabled=LIGHT_MODE_BATCH_DISABLED,
         light_mode_skip_hybrid_match=LIGHT_MODE_SKIP_HYBRID_MATCH,
+        light_mode_workers=LIGHT_MODE_WORKERS,
 
         # 값 검증 설정 (v2에서 추가)
         enable_value_validation=ENABLE_VALUE_VALIDATION,
@@ -7889,6 +7971,9 @@ class POSExtractorV52:
         self.log.info("=" * 60)
         self.log.info("소량 추출 모드 (LIGHT) 시작")
         self.log.info("=" * 60)
+
+        # v53: GPU VRAM 모니터링
+        log_gpu_memory(self.log)
         
         # POS 폴더 결정
         pos_folder = pos_folder or self.config.light_mode_pos_folder
@@ -7984,14 +8069,40 @@ class POSExtractorV52:
             if file_rows.empty:
                 self.log.warning("해당 POS의 템플릿 정보 없음: %s (hull=%s, POS=%s), 다음 파일로 넘어갑니다.", fname, file_hull, file_pos_num)
                 continue
-            
+
             self.log.info("처리 중: %s (hull=%s, %d specs)", fname, file_hull, len(file_rows))
-            
+
+            # v53: 병렬 처리 (3-6 workers)
+            specs_to_extract = []
             for _, row in file_rows.iterrows():
                 spec = self._row_to_spec_item(row, html_path)
-                result = self.extract_single(html_path, spec)
-                result['file_name'] = fname
-                all_results.append(result)
+                specs_to_extract.append((html_path, spec, fname))
+
+            # 병렬 추출
+            workers = self.config.light_mode_workers
+            if workers > 1 and len(specs_to_extract) > 1:
+                self.log.debug(f"병렬 추출 시작: {workers} workers, {len(specs_to_extract)} specs")
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    # Submit all tasks
+                    future_to_spec = {
+                        executor.submit(self._extract_single_with_filename, html_path, spec, fname): spec
+                        for html_path, spec, fname in specs_to_extract
+                    }
+
+                    # Collect results as they complete
+                    for future in as_completed(future_to_spec):
+                        try:
+                            result = future.result()
+                            all_results.append(result)
+                        except Exception as e:
+                            spec = future_to_spec[future]
+                            self.log.error(f"병렬 추출 실패: {spec.spec_name}, error: {e}")
+            else:
+                # Sequential fallback (single worker or single spec)
+                for html_path, spec, fname in specs_to_extract:
+                    result = self.extract_single(html_path, spec)
+                    result['file_name'] = fname
+                    all_results.append(result)
         
         # 결과 저장
         saved = self.save_results(all_results)
@@ -8002,7 +8113,10 @@ class POSExtractorV52:
         self.log.info("  처리 파일: %d개", len(pos_files))
         self.log.info("  추출 결과: %d건", len(all_results))
         self.log.info("=" * 60)
-        
+
+        # v53: GPU VRAM 모니터링 (완료 후)
+        log_gpu_memory(self.log)
+
         self.print_stats()
         
         return all_results, saved
@@ -8026,6 +8140,29 @@ class POSExtractorV52:
             file_path=file_path,
             raw_data=d
         )
+
+    def _extract_single_with_filename(
+        self,
+        html_path: str,
+        spec: SpecItem,
+        fname: str
+    ) -> Dict[str, Any]:
+        """
+        v53: 병렬 처리를 위한 wrapper 메서드
+
+        extract_single을 호출하고 file_name을 추가합니다.
+        Thread-safe한 단위 작업입니다.
+        """
+        try:
+            result = self.extract_single(html_path, spec)
+            result['file_name'] = fname
+            return result
+        except Exception as e:
+            self.log.error(f"추출 실패: {fname} - {spec.spec_name}, error: {e}")
+            # 빈 결과 반환
+            empty_result = self._create_empty_result(spec, "ERROR")
+            empty_result['file_name'] = fname
+            return empty_result
     
     # =========================================================================
     # 결과 저장
