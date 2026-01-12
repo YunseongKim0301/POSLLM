@@ -96,8 +96,9 @@ except ImportError:
 # =============================================================================
 # [1] 추출 모드 설정 (가장 중요!)
 # =============================================================================
-# "full"  : 전체 추출 모드 - Template의 모든 POS 추출
-# "light" : 소량 추출 모드 - POS 폴더 파일 기준으로 해당 row만 추출
+# "full"   : 전체 추출 모드 - Template의 모든 POS 추출
+# "light"  : 소량 추출 모드 - POS 폴더 파일 기준으로 해당 row만 추출
+# "verify" : 검증 모드 - 사양값DB의 기존 값을 POS 문서와 대조하여 검증
 EXTRACTION_MODE = "light"
 
 # =============================================================================
@@ -135,6 +136,18 @@ USE_PRECOMPUTED_EMBEDDINGS = True
 EMBEDDING_TABLE_NAME = "pos_embedding"
 EMBEDDING_TOP_K = 5                    # 유사도 검색 시 상위 K개
 EMBEDDING_SIMILARITY_THRESHOLD = 0.65  # 유사도 임계값
+
+# =============================================================================
+# [6] Verify 모드 전용 설정
+# =============================================================================
+# Verify 모드에서 사양값DB 테이블
+VERIFY_MODE_SPECDB_TABLE = "umgv_fin"
+
+# 단위 변환 허용 오차 (%)
+VERIFY_UNIT_CONVERSION_TOLERANCE = 5.0
+
+# 검증 신뢰도 임계값
+VERIFY_CONFIDENCE_THRESHOLD = 0.7
 
 
 # #############################################################################
@@ -537,6 +550,203 @@ def ensure_parent_dir(file_path: str) -> None:
     parent = os.path.dirname(file_path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
+
+
+# =============================================================================
+# 단위 변환 유틸리티 (Verify 모드용)
+# =============================================================================
+
+# 단위 변환 매핑 (표준 단위 → 배율)
+UNIT_CONVERSION_TABLE = {
+    # 부피 유량 (기준: L/H)
+    'm3/h': 1000.0,
+    'm³/h': 1000.0,
+    'l/h': 1.0,
+    'l/min': 60.0,
+    'l/s': 3600.0,
+
+    # 압력 (기준: bar)
+    'bar': 1.0,
+    'mpa': 10.0,
+    'kpa': 0.01,
+    'kg/cm2': 0.980665,
+    'kg/cm²': 0.980665,
+    'psi': 0.0689476,
+
+    # 온도 (기준: °C) - 차이값만 변환 가능
+    '°c': 1.0,
+    '℃': 1.0,
+    'c': 1.0,
+
+    # 전력 (기준: kW)
+    'kw': 1.0,
+    'w': 0.001,
+    'mw': 1000.0,
+    'hp': 0.7457,
+    'ps': 0.7355,
+
+    # 회전수 (기준: rpm)
+    'rpm': 1.0,
+    'min-1': 1.0,
+
+    # 전압 (기준: V)
+    'v': 1.0,
+    'kv': 1000.0,
+
+    # 주파수 (기준: Hz)
+    'hz': 1.0,
+    'khz': 1000.0,
+
+    # 질량 유량 (기준: kg/h)
+    'kg/h': 1.0,
+    'kg/s': 3600.0,
+    't/h': 1000.0,
+
+    # 길이 (기준: mm)
+    'mm': 1.0,
+    'cm': 10.0,
+    'm': 1000.0,
+    'inch': 25.4,
+    'in': 25.4,
+
+    # 무게 (기준: kg)
+    'kg': 1.0,
+    'g': 0.001,
+    't': 1000.0,
+    'ton': 1000.0,
+}
+
+
+def normalize_unit(unit: str) -> str:
+    """
+    단위 정규화 (대소문자, 특수문자 통일)
+
+    Args:
+        unit: 원본 단위 문자열
+
+    Returns:
+        정규화된 단위
+    """
+    if not unit:
+        return ""
+
+    # 소문자 변환
+    normalized = unit.lower().strip()
+
+    # 공백 제거
+    normalized = normalized.replace(' ', '')
+
+    # 특수문자 통일
+    normalized = normalized.replace('³', '3')
+    normalized = normalized.replace('²', '2')
+    normalized = normalized.replace('º', '°')
+
+    return normalized
+
+
+def convert_unit_value(
+    value: float,
+    from_unit: str,
+    to_unit: str,
+    tolerance_percent: float = 5.0
+) -> Tuple[float, bool]:
+    """
+    단위 변환
+
+    Args:
+        value: 원본 값
+        from_unit: 원본 단위
+        to_unit: 목표 단위
+        tolerance_percent: 허용 오차 (%)
+
+    Returns:
+        (변환된 값, 변환 성공 여부)
+    """
+    # 단위 정규화
+    from_unit_norm = normalize_unit(from_unit)
+    to_unit_norm = normalize_unit(to_unit)
+
+    # 동일 단위
+    if from_unit_norm == to_unit_norm:
+        return value, True
+
+    # 변환 테이블 확인
+    if from_unit_norm not in UNIT_CONVERSION_TABLE:
+        return value, False
+
+    if to_unit_norm not in UNIT_CONVERSION_TABLE:
+        return value, False
+
+    # 기준 단위로 변환 후 목표 단위로 변환
+    from_multiplier = UNIT_CONVERSION_TABLE[from_unit_norm]
+    to_multiplier = UNIT_CONVERSION_TABLE[to_unit_norm]
+
+    # 변환
+    base_value = value * from_multiplier
+    converted_value = base_value / to_multiplier
+
+    return converted_value, True
+
+
+def values_match_with_unit_conversion(
+    value1: str,
+    unit1: str,
+    value2: str,
+    unit2: str,
+    tolerance_percent: float = 5.0
+) -> Tuple[bool, float, str]:
+    """
+    두 값이 단위 변환을 고려하여 일치하는지 확인
+
+    Args:
+        value1, unit1: 첫 번째 값과 단위 (POS에서 추출)
+        value2, unit2: 두 번째 값과 단위 (DB에 등록)
+        tolerance_percent: 허용 오차 (%)
+
+    Returns:
+        (일치 여부, 유사도 점수, 설명)
+    """
+    # 값 추출
+    try:
+        val1 = extract_numeric_value(value1)
+        val2 = extract_numeric_value(value2)
+
+        if val1 is None or val2 is None:
+            # 숫자가 아닌 경우 문자열 비교
+            if value1.strip().upper() == value2.strip().upper():
+                return True, 1.0, "텍스트 완전 일치"
+            else:
+                return False, 0.0, "텍스트 불일치"
+
+        # 단위가 없는 경우
+        if not unit1 or not unit2:
+            # 단위 없이 값만 비교
+            diff_percent = abs(val1 - val2) / max(abs(val2), 0.001) * 100
+            if diff_percent <= tolerance_percent:
+                return True, 1.0 - (diff_percent / tolerance_percent) * 0.3, f"값 일치 (오차 {diff_percent:.1f}%)"
+            else:
+                return False, 0.0, f"값 불일치 (오차 {diff_percent:.1f}%)"
+
+        # 단위 변환 시도
+        converted_val, success = convert_unit_value(val1, unit1, unit2, tolerance_percent)
+
+        if not success:
+            # 변환 실패 - 단위가 호환되지 않음
+            return False, 0.0, f"단위 변환 불가 ({unit1} → {unit2})"
+
+        # 변환된 값과 비교
+        diff_percent = abs(converted_val - val2) / max(abs(val2), 0.001) * 100
+
+        if diff_percent <= tolerance_percent:
+            if diff_percent < 0.1:
+                return True, 1.0, f"완전 일치 ({unit1} → {unit2})"
+            else:
+                return True, 1.0 - (diff_percent / tolerance_percent) * 0.3, f"변환 후 일치 (오차 {diff_percent:.1f}%, {unit1} → {unit2})"
+        else:
+            return False, 0.0, f"변환 후 불일치 (오차 {diff_percent:.1f}%, {unit1} → {unit2})"
+
+    except Exception as e:
+        return False, 0.0, f"비교 오류: {e}"
 
 
 def load_tsv(file_path: str, encoding: str = "utf-8") -> pd.DataFrame:
@@ -5946,6 +6156,8 @@ class POSExtractorV52:
         # 모드별 초기화
         if self.config.extraction_mode == "light":
             self._init_light_mode(glossary_path, specdb_path)
+        elif self.config.extraction_mode == "verify":
+            self._init_verify_mode(glossary_path, specdb_path)
         else:
             self._init_full_mode(glossary_path, specdb_path)
         
@@ -6090,7 +6302,27 @@ class POSExtractorV52:
         
         elapsed = time.time() - start
         self.log.info("Light 모드 초기화 완료: %.2f초", elapsed)
-    
+
+    def _init_verify_mode(self, glossary_path: str, specdb_path: str):
+        """
+        Verify 모드 초기화
+
+        사양값DB의 기존 값을 POS 문서와 대조하여 검증
+        Light 모드와 동일하게 초기화하되, 검증 전용 컴포넌트 추가
+        """
+        self.log.info("Verify 모드 초기화 시작")
+        start = time.time()
+
+        # Light 모드와 동일한 초기화 (용어집, 사양값DB 로드)
+        self._init_light_mode(glossary_path, specdb_path)
+
+        # Verify 전용 설정
+        self.verify_tolerance = VERIFY_UNIT_CONVERSION_TOLERANCE
+        self.verify_confidence_threshold = VERIFY_CONFIDENCE_THRESHOLD
+
+        elapsed = time.time() - start
+        self.log.info("Verify 모드 초기화 완료: %.2f초", elapsed)
+
     def _init_full_mode(self, glossary_path: str, specdb_path: str):
         """
         Full 모드 초기화
@@ -6665,6 +6897,263 @@ class POSExtractorV52:
             "saved_files": saved_files,
             "results": all_results
         }
+
+    def verify_full(
+        self,
+        html_folder: str = None
+    ) -> Dict[str, Any]:
+        """
+        Verify 모드: 사양값DB의 기존 값을 POS 문서와 대조하여 검증
+
+        프로세스:
+        1. 사양값DB에서 기존 값 로드 (umgv_value, umgv_uom)
+        2. POS 문서에서 실제 값 추출 (pos_umgv_value, pos_umgv_uom)
+        3. 단위 변환을 고려하여 값 비교
+        4. 명칭 차이 고려 (umgv_desc vs pos_umgv_desc)
+        5. 검증 결과 반환 (일치/불일치, 신뢰도)
+
+        Returns:
+            검증 결과 딕셔너리
+        """
+        self.log.info("=" * 80)
+        self.log.info("Verify 모드 검증 시작")
+        self.log.info("=" * 80)
+
+        # 폴더 설정
+        folder = html_folder or self.config.light_mode_pos_folder
+        if not folder or not os.path.exists(folder):
+            raise ValueError(f"HTML 폴더를 찾을 수 없습니다: {folder}")
+
+        # HTML 파일 목록
+        html_files = []
+        for filename in sorted(os.listdir(folder)):
+            if filename.lower().endswith('.html'):
+                html_files.append(os.path.join(folder, filename))
+
+        self.log.info("총 %d개 HTML 파일 발견", len(html_files))
+
+        if not html_files:
+            self.log.warning("처리할 HTML 파일이 없습니다")
+            return {"status": "no_files", "total_files": 0, "verification_results": []}
+
+        # 검증 결과
+        all_verifications = []
+        total_verified = 0
+        total_matched = 0
+        total_mismatched = 0
+        total_db_missing = 0
+
+        for idx, html_file in enumerate(html_files, 1):
+            self.log.info("-" * 80)
+            self.log.info("[%d/%d] 검증 중: %s", idx, len(html_files), os.path.basename(html_file))
+            self.log.info("-" * 80)
+
+            try:
+                # 사양값DB에서 기존 값 로드
+                db_values = self._load_db_values_for_file(html_file)
+
+                if not db_values:
+                    self.log.warning("사양값DB에 데이터 없음, 스킵: %s", os.path.basename(html_file))
+                    continue
+
+                self.log.info("사양값DB 로드: %d개 항목", len(db_values))
+
+                # 각 DB 값에 대해 검증
+                for db_item in db_values:
+                    verification = self._verify_single_item(html_file, db_item)
+                    all_verifications.append(verification)
+
+                    total_verified += 1
+                    if verification['verification_status'] == 'MATCHED':
+                        total_matched += 1
+                    elif verification['verification_status'] == 'MISMATCHED':
+                        total_mismatched += 1
+                    elif verification['verification_status'] == 'DB_MISSING':
+                        total_db_missing += 1
+
+                    # 로그 출력
+                    status = verification['verification_status']
+                    confidence = verification['verification_confidence']
+                    self.log.info(
+                        "  %s: %s (신뢰도: %.2f) - %s",
+                        db_item['umgv_desc'],
+                        status,
+                        confidence,
+                        verification['verification_reason']
+                    )
+
+            except Exception as e:
+                self.log.error("파일 검증 실패 %s: %s", os.path.basename(html_file), e)
+                continue
+
+        # 검증 통계
+        match_rate = (total_matched / total_verified * 100) if total_verified > 0 else 0.0
+        mismatch_rate = (total_mismatched / total_verified * 100) if total_verified > 0 else 0.0
+
+        self.log.info("=" * 80)
+        self.log.info("검증 완료")
+        self.log.info("총 검증: %d개", total_verified)
+        self.log.info("일치: %d개 (%.1f%%)", total_matched, match_rate)
+        self.log.info("불일치: %d개 (%.1f%%)", total_mismatched, mismatch_rate)
+        self.log.info("DB 누락: %d개", total_db_missing)
+        self.log.info("=" * 80)
+
+        # 결과 저장
+        self._save_verification_results(all_verifications)
+
+        return {
+            "status": "success",
+            "total_files": len(html_files),
+            "total_verified": total_verified,
+            "total_matched": total_matched,
+            "total_mismatched": total_mismatched,
+            "total_db_missing": total_db_missing,
+            "match_rate": match_rate,
+            "mismatch_rate": mismatch_rate,
+            "verification_results": all_verifications
+        }
+
+    def _load_db_values_for_file(self, html_file: str) -> List[Dict]:
+        """
+        HTML 파일에 대응하는 사양값DB 데이터 로드
+
+        Returns:
+            사양값DB 항목 리스트 (umgv_value, umgv_uom 포함)
+        """
+        if not self.pg_loader:
+            self.log.warning("PostgreSQL 연결 없음 - 사양값DB 로드 불가")
+            return []
+
+        filename = os.path.basename(html_file)
+        hull = self._extract_hull_from_filename(filename)
+
+        if not hull:
+            self.log.warning("Hull 추출 실패: %s", filename)
+            return []
+
+        try:
+            # 사양값DB 로드 (umgv_fin 테이블)
+            query = f"""
+                SELECT
+                    umgv_desc, umgv_code, umgv_value, umgv_uom,
+                    pos_extwg_desc, pos_umgv_desc,
+                    matnr, doknr
+                FROM {VERIFY_MODE_SPECDB_TABLE}
+                WHERE matnr LIKE %s
+                ORDER BY umgv_desc
+            """
+
+            conn = self.pg_loader.get_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(query, (f"{hull}%",))
+            rows = cursor.fetchall()
+            cursor.close()
+
+            db_values = [dict(row) for row in rows]
+            return db_values
+
+        except Exception as e:
+            self.log.error("사양값DB 로드 실패: %s", e)
+            return []
+
+    def _verify_single_item(self, html_file: str, db_item: Dict) -> Dict:
+        """
+        단일 항목 검증
+
+        Args:
+            html_file: POS HTML 파일 경로
+            db_item: 사양값DB 항목 (umgv_value, umgv_uom 포함)
+
+        Returns:
+            검증 결과 딕셔너리
+        """
+        # DB 값
+        db_value = norm(db_item.get('umgv_value', ''))
+        db_unit = norm(db_item.get('umgv_uom', ''))
+        umgv_desc = norm(db_item.get('umgv_desc', ''))
+        pos_umgv_desc = norm(db_item.get('pos_umgv_desc', ''))
+
+        # SpecItem 생성
+        spec = SpecItem(
+            spec_name=umgv_desc,
+            spec_code=db_item.get('umgv_code', ''),
+            equipment=db_item.get('pos_extwg_desc', ''),
+            expected_unit=db_unit,
+            matnr=db_item.get('matnr', ''),
+            hull=self._extract_hull_from_filename(os.path.basename(html_file)),
+            raw_data=db_item
+        )
+
+        # POS 문서에서 값 추출
+        extraction_result = self.extract_single(html_file, spec)
+        pos_value = norm(extraction_result.get('pos_umgv_value', ''))
+        pos_unit = norm(extraction_result.get('pos_umgv_uom', ''))
+
+        # DB에 값이 없는 경우
+        if not db_value:
+            return {
+                **db_item,
+                'pos_umgv_value': pos_value,
+                'pos_umgv_uom': pos_unit,
+                'verification_status': 'DB_MISSING',
+                'verification_confidence': 0.0,
+                'verification_reason': 'DB에 값 없음'
+            }
+
+        # POS에서 값을 찾지 못한 경우
+        if not pos_value:
+            return {
+                **db_item,
+                'pos_umgv_value': pos_value,
+                'pos_umgv_uom': pos_unit,
+                'verification_status': 'POS_NOT_FOUND',
+                'verification_confidence': 0.0,
+                'verification_reason': 'POS 문서에서 값 추출 실패'
+            }
+
+        # 값 비교 (단위 변환 고려)
+        matched, confidence, reason = values_match_with_unit_conversion(
+            pos_value, pos_unit,
+            db_value, db_unit,
+            tolerance_percent=self.verify_tolerance
+        )
+
+        # 명칭 차이 고려 (pos_umgv_desc vs umgv_desc)
+        name_match = (umgv_desc.upper() == pos_umgv_desc.upper()) if pos_umgv_desc else True
+        if not name_match:
+            reason += f" (명칭 차이: {umgv_desc} vs {pos_umgv_desc})"
+
+        status = 'MATCHED' if matched and confidence >= self.verify_confidence_threshold else 'MISMATCHED'
+
+        return {
+            **db_item,
+            'pos_umgv_value': pos_value,
+            'pos_umgv_uom': pos_unit,
+            'verification_status': status,
+            'verification_confidence': confidence,
+            'verification_reason': reason
+        }
+
+    def _save_verification_results(self, verifications: List[Dict]):
+        """검증 결과 저장"""
+        if not self.config.output_path:
+            return
+
+        os.makedirs(self.config.output_path, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        # JSON 저장
+        json_path = os.path.join(self.config.output_path, f"verification_result_{timestamp}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(verifications, f, ensure_ascii=False, indent=2)
+        self.log.info("검증 결과 JSON 저장: %s", json_path)
+
+        # CSV 저장
+        if HAS_PANDAS:
+            csv_path = os.path.join(self.config.output_path, f"verification_result_{timestamp}.csv")
+            df = pd.DataFrame(verifications)
+            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            self.log.info("검증 결과 CSV 저장: %s", csv_path)
 
     def _load_template_for_file(self, html_file: str) -> List[SpecItem]:
         """
