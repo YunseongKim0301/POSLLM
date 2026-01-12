@@ -1478,7 +1478,7 @@ class PostgresEmbeddingLoader:
         """embedding_key로 레코드 조회"""
         if not self.conn:
             return None
-        
+
         try:
             cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             query = f"""
@@ -1493,6 +1493,111 @@ class PostgresEmbeddingLoader:
         except Exception as e:
             self.log.error("임베딩 조회 실패: %s", e)
             return None
+
+    def search_by_key_with_fallback(
+        self,
+        search_key: str,
+        query_text: str = "",
+        embedding_model: Any = None,
+        top_k: int = 3,
+        similarity_threshold: float = 0.7
+    ) -> List[Dict]:
+        """
+        v53: 하이브리드 검색 - search_key exact match → embedding similarity fallback
+
+        Schema (pos_embedding table):
+        - search_key: hull_pmg_code_umg_code_extwg (exact match용)
+        - embedding_key: hull_pmg_desc_umg_desc_mat_attr_desc (similarity용)
+        - embedding: BGE-M3 vector
+
+        Args:
+            search_key: 정확 매칭용 키 (hull_pmg_code_umg_code_extwg)
+            query_text: 유사도 검색용 텍스트 (embedding_key 생성)
+            embedding_model: BGE-M3 모델 (유사도 검색 시 사용)
+            top_k: 반환할 최대 결과 수
+            similarity_threshold: 유사도 임계값
+
+        Returns:
+            매칭된 레코드 리스트 (exact match 우선, 없으면 similarity)
+        """
+        if not self.conn:
+            return []
+
+        # Step 1: search_key exact match 시도
+        try:
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = f"""
+                SELECT * FROM {self.config.embedding_table_name}
+                WHERE search_key = %s
+                LIMIT {top_k}
+            """
+            cur.execute(query, (search_key,))
+            rows = cur.fetchall()
+            cur.close()
+
+            if rows:
+                self.log.debug(f"search_key exact match 성공: {search_key} ({len(rows)} rows)")
+                return [dict(row) for row in rows]
+
+        except Exception as e:
+            self.log.debug(f"search_key 조회 실패: {e}")
+
+        # Step 2: Embedding similarity fallback
+        if not query_text or not embedding_model:
+            self.log.debug("query_text 또는 embedding_model 없음, similarity fallback 생략")
+            return []
+
+        try:
+            # Query text를 embedding으로 변환
+            query_embedding = embedding_model.encode([query_text])[0].tolist()
+
+            # embedding_key 기반 유사도 검색
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = f"""
+                SELECT * FROM {self.config.embedding_table_name}
+                LIMIT 500
+            """
+            cur.execute(query)
+            rows = cur.fetchall()
+            cur.close()
+
+            if not rows:
+                return []
+
+            # Python에서 코사인 유사도 계산
+            results = []
+            for row in rows:
+                emb_str = row.get('embedding', '')
+                if not emb_str:
+                    continue
+
+                try:
+                    if isinstance(emb_str, str):
+                        emb_str = emb_str.strip('[]')
+                        db_embedding = [float(x) for x in emb_str.split(',')]
+                    else:
+                        db_embedding = list(emb_str)
+                except:
+                    continue
+
+                similarity = self._cosine_similarity(query_embedding, db_embedding)
+
+                if similarity >= similarity_threshold:
+                    row_dict = dict(row)
+                    row_dict['similarity'] = similarity
+                    results.append(row_dict)
+
+            # 유사도 내림차순 정렬
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+
+            if results:
+                self.log.debug(f"Embedding similarity fallback 성공: {len(results)} matches")
+
+            return results[:top_k]
+
+        except Exception as e:
+            self.log.error(f"Embedding similarity fallback 실패: {e}")
+            return []
     
     def load_template_from_db(self, table_name: str = "") -> pd.DataFrame:
         """DB에서 추출 템플릿 로드"""
@@ -4356,17 +4461,24 @@ class ChunkQualityScorer:
         spec: SpecItem,
         hint: ExtractionHint
     ) -> float:
-        """키워드 점수"""
+        """키워드 점수 (v53: spec-specific 강화)"""
         score = 0.0
         text_upper = candidate.text.upper()
+        spec_upper = spec.spec_name.upper()
 
-        # Spec name
-        if spec.spec_name.upper() in text_upper:
+        # v53: Spec name이 정확히 있는지 체크 (부분 매칭이 아닌 단어 경계 체크)
+        # 예: "TEMPERATURE"가 "MAX. TEMPERATURE"에만 매칭되고 다른 TEMPERATURE에는 낮은 점수
+        if spec_upper in text_upper:
             score += 0.15
 
-        # Equipment
-        if spec.equipment and spec.equipment.upper() in text_upper:
-            score += 0.1
+            # 더 구체적인 매칭 (장비명도 함께 있으면 보너스)
+            if spec.equipment and spec.equipment.upper() in text_upper:
+                score += 0.1  # 추가 보너스
+        else:
+            # Spec name이 없으면 매우 낮은 점수
+            return 0.0
+
+        # Equipment만 있고 spec name이 없는 경우는 이미 위에서 0.0 반환
 
         # 동의어
         if hint and hint.pos_umgv_desc:
@@ -4417,6 +4529,19 @@ class ChunkQualityScorer:
         """섹션 관련성 점수"""
         score = 0.0
         section_num = candidate.section_num
+        text_upper = candidate.text.upper()
+
+        # v53: GENERAL section 및 무의미한 chunk 강력 필터링
+        # 이러한 패턴은 사양값이 없는 메타 정보
+        if any(pattern in text_upper for pattern in [
+            'GENERAL', 'REVIEWED', '[DOCUMENT EXCERPT]', 'TABLE OF CONTENTS',
+            'REVISION', 'APPROVAL', 'SIGNATURE'
+        ]):
+            return -0.5  # 강력한 페널티
+
+        # 너무 짧고 의미없는 chunk
+        if len(candidate.text.strip()) < 20:
+            return -0.3
 
         # Section 2 가산점
         if section_num and section_num.startswith('2'):
