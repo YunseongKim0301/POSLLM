@@ -2612,6 +2612,7 @@ class HTMLChunkParser:
         self.file_path = file_path
         self.soup = None
         self.tables = []           # 원시 테이블 (2D 배열)
+        self.table_structures = [] # v2에서 추가: 테이블 구조 정보 (헤더, 데이터 행 위치)
         self.kv_pairs = []         # 키-값 쌍 리스트
         self.text_chunks = []
         
@@ -2634,23 +2635,51 @@ class HTMLChunkParser:
         self._extract_text_chunks()
     
     def _extract_tables(self):
-        """테이블 추출 (개선)"""
+        """테이블 추출 (v2 개선: 구조 정보 포함)"""
         if not self.soup:
             return
-        
+
+        self.tables = []
+        self.table_structures = []
+
         for table in self.soup.find_all('table'):
-            rows = []
-            for tr in table.find_all('tr'):
+            table_data = []
+            rows = table.find_all('tr')
+
+            # 구조 정보 초기화
+            structure = {
+                'header_row_idx': -1,
+                'header_cols': [],
+                'data_start_row': 0,
+                'col_count': 0
+            }
+
+            for row_idx, row in enumerate(rows):
                 cells = []
-                for td in tr.find_all(['td', 'th']):
-                    # 텍스트 추출 (공백 정규화)
-                    text = td.get_text(strip=True)
+                cell_tags = row.find_all(['td', 'th'])
+
+                for cell in cell_tags:
+                    text = cell.get_text(strip=True)
                     text = re.sub(r'\s+', ' ', text).strip()
                     cells.append(text)
+
                 if cells and any(c for c in cells):  # 비어있지 않은 행만
-                    rows.append(cells)
-            if rows:
-                self.tables.append(rows)
+                    table_data.append(cells)
+
+                    # 헤더 행 감지 (v2: 개선된 로직)
+                    has_th = row.find('th') is not None
+                    if has_th or (row_idx == 0 and structure['header_row_idx'] == -1):
+                        # 헤더 행인지 추가 검증
+                        if self._is_likely_header_row_v2(cells):
+                            structure['header_row_idx'] = len(table_data) - 1  # table_data 인덱스 사용
+                            structure['header_cols'] = cells
+                            structure['data_start_row'] = len(table_data)  # 다음 행부터 데이터
+
+                    structure['col_count'] = max(structure['col_count'], len(cells))
+
+            if table_data:
+                self.tables.append(table_data)
+                self.table_structures.append(structure)
     
     def _extract_kv_pairs(self):
         """
@@ -2730,21 +2759,57 @@ class HTMLChunkParser:
         
         return key
     
+    def _is_likely_header_row_v2(self, cells: List[str]) -> bool:
+        """
+        헤더 행인지 판단 (v2 개선: 키워드 카운트 기반)
+
+        개선사항:
+        - 헤더 키워드 수 카운트
+        - 숫자값 비율 확인
+        - 더 정교한 판단
+        """
+        if not cells:
+            return False
+
+        # 헤더 키워드 (v2)
+        header_keywords = [
+            'type', 'item', 'description', 'spec', 'specification', 'parameter',
+            'unit', 'value', 'qty', "q'ty", 'quantity', 'remark', 'no.', 'no',
+            'name', 'model', 'capacity', 'material', 'maker', 'size'
+        ]
+
+        keyword_count = 0
+        numeric_count = 0
+
+        for cell in cells:
+            cell_lower = cell.lower().strip()
+
+            # 헤더 키워드 확인
+            if any(kw in cell_lower for kw in header_keywords):
+                keyword_count += 1
+
+            # 숫자값 확인 (데이터 행일 가능성)
+            if re.match(r'^[\d,.\-]+\s*[a-zA-Z]*$', cell.strip()):
+                numeric_count += 1
+
+        # 키워드가 많고 숫자가 적으면 헤더
+        return keyword_count >= 2 or (keyword_count >= 1 and numeric_count == 0)
+
     def _is_header_row_table(self, table: List[List[str]]) -> bool:
         """
         테이블의 첫 행이 헤더인지 판단 (v52.2 개선)
-        
+
         헤더 판단 기준:
         - 첫 행의 모든 셀이 짧은 텍스트 (헤더 키워드)
         - 첫 행에 숫자+단위가 없음 (데이터 행이면 숫자가 있음)
         """
         if not table or len(table) < 2:
             return False
-        
+
         first_row = table[0]
         if not first_row:
             return False
-        
+
         # 첫 행에 숫자+단위 패턴이 있으면 데이터 행 (헤더 아님)
         for cell in first_row:
             # 숫자+단위 패턴: "1,000 mbar", "45℃", "120 mm" 등
@@ -2901,7 +2966,90 @@ class HTMLChunkParser:
         
         if current_chunk:
             self.text_chunks.append('\n'.join(current_chunk))
-    
+
+    def search_in_tables_enhanced(self, keywords: List[str]) -> List[Dict]:
+        """
+        테이블 검색 (v2 개선: 위치 기반 값 추출)
+
+        개선사항:
+        - 헤더/데이터 구분
+        - 열 위치 기반 값 추출
+        - Case 1: 키워드가 헤더에 있으면 해당 열의 데이터 추출
+        - Case 2: 키워드가 데이터에 있으면 인접 셀 추출
+        """
+        results = []
+
+        for t_idx, table in enumerate(self.tables):
+            structure = self.table_structures[t_idx] if t_idx < len(self.table_structures) else {}
+            header_row_idx = structure.get('header_row_idx', -1)
+            header_cols = structure.get('header_cols', [])
+            data_start_row = structure.get('data_start_row', 0)
+
+            for r_idx, row in enumerate(table):
+                row_text = ' '.join(row).lower()
+
+                for keyword in keywords:
+                    kw_lower = keyword.lower()
+
+                    if kw_lower not in row_text:
+                        continue
+
+                    # 키워드가 어느 셀에 있는지 찾기
+                    match_col_idx = -1
+                    for c_idx, cell in enumerate(row):
+                        if kw_lower in cell.lower():
+                            match_col_idx = c_idx
+                            break
+
+                    if match_col_idx == -1:
+                        continue
+
+                    # Case 1: 키워드가 헤더에 있는 경우 → 해당 열의 데이터 추출
+                    if r_idx == header_row_idx:
+                        # 데이터 행에서 해당 열의 값 추출
+                        for data_row_idx in range(data_start_row, len(table)):
+                            data_row = table[data_row_idx]
+                            if match_col_idx < len(data_row):
+                                value = data_row[match_col_idx]
+                                if value and not self._is_likely_header_keyword(value):
+                                    results.append({
+                                        'table_idx': t_idx,
+                                        'row_idx': data_row_idx,
+                                        'col_idx': match_col_idx,
+                                        'row': data_row,
+                                        'value': value,
+                                        'match_type': 'header_column'
+                                    })
+
+                    # Case 2: 키워드가 데이터 행에 있는 경우 → 인접 셀 추출
+                    else:
+                        # 오른쪽 셀 확인
+                        if match_col_idx + 1 < len(row):
+                            value = row[match_col_idx + 1]
+                            if value and not self._is_likely_header_keyword(value):
+                                results.append({
+                                    'table_idx': t_idx,
+                                    'row_idx': r_idx,
+                                    'col_idx': match_col_idx + 1,
+                                    'row': row,
+                                    'value': value,
+                                    'match_type': 'adjacent_cell'
+                                })
+
+        return results
+
+    def _is_likely_header_keyword(self, value: str) -> bool:
+        """헤더 키워드일 가능성 체크 (값이 아닌 헤더)"""
+        value_upper = value.upper().strip()
+
+        # 일반적인 헤더 키워드
+        header_keywords = ['type', 'qty', "q'ty", 'remark', 'unit', 'item', 'description',
+                          'spec', 'specification', 'parameter', 'value', 'no.', 'no']
+        if value_upper.lower() in [kw.lower() for kw in header_keywords]:
+            return True
+
+        return False
+
     def find_value_in_tables(
         self, 
         spec_name: str, 
@@ -3727,6 +3875,108 @@ class RuleBasedExtractor:
                 return True
         
         return False
+
+
+# =============================================================================
+# UnifiedLLMClient (v2에서 추가 - Ollama 전용)
+# =============================================================================
+
+class UnifiedLLMClient:
+    """
+    Ollama LLM 클라이언트 (포트 로테이션 지원)
+
+    개선사항 (v2):
+    - 포트 로테이션으로 부하 분산
+    - 스레드 안전 포트 선택
+    - 토큰 추적
+    """
+
+    def __init__(self, ollama_host: str = "127.0.0.1", ollama_ports: List[int] = None,
+                 model: str = "gemma3n:e4b", timeout: int = 180,
+                 temperature: float = 0.0, max_retries: int = 3,
+                 retry_sleep: float = 1.5, rate_limit: float = 0.3,
+                 logger: logging.Logger = None):
+        self.host = ollama_host
+        self.ports = ollama_ports or [11434]
+        self.model = model
+        self.timeout = timeout
+        self.temperature = temperature
+        self.max_retries = max_retries
+        self.retry_sleep = retry_sleep
+        self.rate_limit = rate_limit
+        self.logger = logger or logging.getLogger("UnifiedLLMClient")
+
+        # 포트 로테이션
+        self.port_index = 0
+        self.port_lock = threading.Lock()
+
+        # 토큰 추적
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_calls = 0
+
+    def generate(self, prompt: str) -> Tuple[str, int, int]:
+        """
+        LLM 응답 생성
+
+        Returns:
+            (response_text, input_tokens, output_tokens)
+        """
+        if not HAS_REQUESTS:
+            self.logger.warning("requests 라이브러리 없음")
+            return "", 0, 0
+
+        # 포트 로테이션 (스레드 안전)
+        with self.port_lock:
+            port = self.ports[self.port_index]
+            self.port_index = (self.port_index + 1) % len(self.ports)
+
+        url = f"http://{self.host}:{port}/api/generate"
+
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": self.temperature}
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                time.sleep(self.rate_limit)
+
+                response = requests.post(url, json=payload, timeout=self.timeout)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data.get('response', '')
+
+                    # 토큰 추정 (4 chars = 1 token)
+                    input_tokens = len(prompt) // 4
+                    output_tokens = len(text) // 4
+
+                    self.total_input_tokens += input_tokens
+                    self.total_output_tokens += output_tokens
+                    self.total_calls += 1
+
+                    return text, input_tokens, output_tokens
+
+            except requests.exceptions.Timeout:
+                self.logger.warning(f"Ollama 타임아웃 (attempt {attempt + 1}/{self.max_retries})")
+            except Exception as e:
+                self.logger.warning(f"Ollama 오류: {e}")
+
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_sleep)
+
+        return "", 0, 0
+
+    def get_stats(self) -> Dict:
+        """통계 반환"""
+        return {
+            'total_calls': self.total_calls,
+            'total_input_tokens': self.total_input_tokens,
+            'total_output_tokens': self.total_output_tokens
+        }
 
 
 # =============================================================================
