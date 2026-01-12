@@ -115,6 +115,7 @@ SAVE_JSON = True           # nested JSON 저장
 SAVE_CSV = False            # 기본 CSV 저장
 SAVE_DEBUG_CSV = False      # 디버그 CSV (참조 정보 포함) 저장
 SAVE_TO_DB = False         # PostgreSQL에 결과 저장
+PRINT_JSON = True          # JSON 결과를 콘솔에도 출력 (pretty print)
 
 # =============================================================================
 # [4] Light 모드 전용 설정
@@ -845,6 +846,7 @@ class Config:
     save_csv: bool = True
     save_debug_csv: bool = True
     save_to_db: bool = False
+    print_json: bool = True
     
     # 경로
     base_folder: str = ""
@@ -958,6 +960,7 @@ def build_config() -> Config:
         save_csv=SAVE_CSV,
         save_debug_csv=SAVE_DEBUG_CSV,
         save_to_db=SAVE_TO_DB,
+        print_json=PRINT_JSON,
         
         # 경로
         base_folder=USER_BASE_FOLDER,
@@ -7148,6 +7151,14 @@ class POSExtractorV52:
             json.dump(verifications, f, ensure_ascii=False, indent=2)
         self.log.info("검증 결과 JSON 저장: %s", json_path)
 
+        # 콘솔 출력 (PRINT_JSON 옵션)
+        if self.config.print_json:
+            print("\n" + "=" * 80)
+            print("Verify 모드 검증 결과 (Pretty Print)")
+            print("=" * 80)
+            print(json.dumps(verifications, ensure_ascii=False, indent=2))
+            print("=" * 80 + "\n")
+
         # CSV 저장
         if HAS_PANDAS:
             csv_path = os.path.join(self.config.output_path, f"verification_result_{timestamp}.csv")
@@ -7926,11 +7937,19 @@ class POSExtractorV52:
         
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(nested_results, f, ensure_ascii=False, indent=2)
-        
+
         total_items = sum(len(g["items"]) for g in nested_results)
-        self.log.info("JSON 저장: %s (%d doknr, %d items)", 
+        self.log.info("JSON 저장: %s (%d doknr, %d items)",
                      output_path, len(nested_results), total_items)
-        
+
+        # 콘솔 출력 (PRINT_JSON 옵션)
+        if self.config.print_json:
+            print("\n" + "=" * 80)
+            print("JSON 추출 결과 (Pretty Print)")
+            print("=" * 80)
+            print(json.dumps(nested_results, ensure_ascii=False, indent=2))
+            print("=" * 80 + "\n")
+
         return output_path
     
     def _save_csv(self, results: List[Dict]) -> str:
