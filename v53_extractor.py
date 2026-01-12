@@ -238,15 +238,6 @@ MAX_VALUE_LENGTH = 200
 SPLIT_COMPOUND_VALUES = True  # 슬래시(/) 구분 복합값 분리 여부
 SPLIT_RANGE_VALUES = True     # 범위(~, -) 값 분리 여부
 
-# =============================================================================
-# Claude API 설정 (v2에서 추가)
-# =============================================================================
-USE_CLAUDE_API = False  # Claude API 사용 여부 (기본은 Ollama)
-CLAUDE_API_KEY = ""     # Claude API 키
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"  # Claude 모델명
-CLAUDE_MAX_TOKENS = 4096
-CLAUDE_TEMPERATURE = 0.0
-
 
 # =============================================================================
 # 로깅 설정
@@ -699,13 +690,6 @@ class Config:
     split_compound_values: bool = True
     split_range_values: bool = True
 
-    # Claude API 설정 (v2에서 추가)
-    use_claude_api: bool = False
-    claude_api_key: str = ""
-    claude_model: str = "claude-3-5-sonnet-20241022"
-    claude_max_tokens: int = 4096
-    claude_temperature: float = 0.0
-
 
 def build_config() -> Config:
     """사용자 설정을 Config 객체로 변환"""
@@ -799,13 +783,6 @@ def build_config() -> Config:
         # 복합값/범위값 파싱 (v2에서 추가)
         split_compound_values=SPLIT_COMPOUND_VALUES,
         split_range_values=SPLIT_RANGE_VALUES,
-
-        # Claude API 설정 (v2에서 추가)
-        use_claude_api=USE_CLAUDE_API,
-        claude_api_key=CLAUDE_API_KEY,
-        claude_model=CLAUDE_MODEL,
-        claude_max_tokens=CLAUDE_MAX_TOKENS,
-        claude_temperature=CLAUDE_TEMPERATURE,
     )
 
 
@@ -1010,9 +987,8 @@ class ValueValidator:
         self.config = config
         self.logger = logging.getLogger("ValueValidator")
 
-    def validate(self, result: ExtractionResult, spec: SpecItem,
-                 historical_values: List[float] = None) -> ExtractionResult:
-        """추출 결과 검증"""
+    def validate(self, result: ExtractionResult, spec: SpecItem) -> ExtractionResult:
+        """추출 결과 검증 (과거 값 비교 제외 - 사양값은 변경 가능)"""
         if not self.config.enable_value_validation:
             return result
 
@@ -1036,14 +1012,6 @@ class ValueValidator:
                 # 숫자형인데 숫자가 없음 → 잘못된 추출 가능성
                 validation_issues.append("숫자형 사양이나 숫자 없음")
                 result.confidence *= 0.6
-            elif historical_values:
-                # 과거 값과 비교
-                avg_historical = sum(historical_values) / len(historical_values)
-                if avg_historical > 0:
-                    variance = abs(numeric_val - avg_historical) / avg_historical
-                    if variance > self.config.numeric_variance_threshold:
-                        validation_issues.append(f"과거 값({avg_historical:.1f})과 차이 큼({variance:.1%})")
-                        result.confidence *= 0.7
 
         # 3. 단위 검증
         if spec.expected_unit and result.unit:
@@ -4151,35 +4119,56 @@ class POSExtractorV52:
         self.log.info("Light 모드 초기화 시작 (최적화)")
         start = time.time()
         
-        # pos_embedding DB 연동 (먼저 연결 - DB 모드에서 필요)
-        self.pg_loader = None
-        if self.config.use_precomputed_embeddings or self.config.data_source_mode == "db":
+        # DATA_SOURCE_MODE에 따라 용어집/사양값DB 로드
+        if self.config.data_source_mode == "db":
+            # DB 모드: PostgreSQL에서 로드
+            self.log.info("데이터 소스: DB 모드")
+
+            # pos_embedding DB 연결
             try:
                 self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
             except Exception as e:
-                self.log.warning("PostgreSQL 연결 실패: %s", e)
-        
-        # DATA_SOURCE_MODE에 따라 용어집/사양값DB 로드
-        if self.config.data_source_mode == "db" and self.pg_loader:
-            # DB 모드: PostgreSQL에서 로드
-            self.log.info("데이터 소스: DB 모드")
-            
+                self.log.error("PostgreSQL 연결 실패: %s", e)
+                self.log.error("DB 모드에서는 PostgreSQL 연결이 필수입니다. 프로그램을 종료합니다.")
+                raise RuntimeError(f"PostgreSQL 연결 실패: {e}")
+
             # 용어집 로드 (pos_dict 테이블)
             glossary_df = self.pg_loader.load_glossary_from_db()
-            self.glossary = LightweightGlossaryIndex(df=glossary_df) if not glossary_df.empty else None
-            
+            if glossary_df.empty:
+                self.log.error("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다.")
+                raise RuntimeError("용어집 로드 실패")
+            self.glossary = LightweightGlossaryIndex(df=glossary_df)
+
             # 사양값DB 로드 (umgv_fin 테이블)
             specdb_df = self.pg_loader.load_specdb_from_db()
-            self.specdb = LightweightSpecDBIndex(df=specdb_df) if not specdb_df.empty else None
+            if specdb_df.empty:
+                self.log.error("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다.")
+                raise RuntimeError("사양값DB 로드 실패")
+            self.specdb = LightweightSpecDBIndex(df=specdb_df)
         else:
             # 파일 모드: 로컬 파일에서 로드
             self.log.info("데이터 소스: 파일 모드")
-            
+            self.pg_loader = None
+
             gpath = glossary_path or self.config.glossary_path
-            self.glossary = LightweightGlossaryIndex(file_path=gpath) if gpath and os.path.exists(gpath) else None
-            
+            if not gpath or not os.path.exists(gpath):
+                self.log.error(f"용어집 파일 없음: {gpath}")
+                raise RuntimeError(f"용어집 파일 없음: {gpath}")
+            self.glossary = LightweightGlossaryIndex(file_path=gpath)
+
             spath = specdb_path or self.config.specdb_path
-            self.specdb = LightweightSpecDBIndex(file_path=spath) if spath and os.path.exists(spath) else None
+            if not spath or not os.path.exists(spath):
+                self.log.error(f"사양값DB 파일 없음: {spath}")
+                raise RuntimeError(f"사양값DB 파일 없음: {spath}")
+            self.specdb = LightweightSpecDBIndex(file_path=spath)
+
+            # 파일 모드에서 임베딩이 필요한 경우에만 DB 연결 시도
+            if self.config.use_precomputed_embeddings:
+                try:
+                    self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
+                except Exception as e:
+                    self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
+                    self.pg_loader = None
         
         # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
         self.synonym_manager = SynonymManager()
@@ -4229,34 +4218,57 @@ class POSExtractorV52:
         """
         self.log.info("Full 모드 초기화 시작")
         start = time.time()
-        
-        # DB 연결 (먼저 연결 - DB 모드에서 필요)
-        self.pg_loader = None
-        if self.config.use_precomputed_embeddings or self.config.data_source_mode == "db":
-            try:
-                self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
-            except:
-                pass
-        
+
         # DATA_SOURCE_MODE에 따라 용어집/사양값DB 로드
-        if self.config.data_source_mode == "db" and self.pg_loader:
+        if self.config.data_source_mode == "db":
             # DB 모드: PostgreSQL에서 로드
             self.log.info("데이터 소스: DB 모드")
-            
+
+            # pos_embedding DB 연결
+            try:
+                self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
+            except Exception as e:
+                self.log.error("PostgreSQL 연결 실패: %s", e)
+                self.log.error("DB 모드에서는 PostgreSQL 연결이 필수입니다. 프로그램을 종료합니다.")
+                raise RuntimeError(f"PostgreSQL 연결 실패: {e}")
+
+            # 용어집 로드 (pos_dict 테이블)
             glossary_df = self.pg_loader.load_glossary_from_db()
-            self.glossary = LightweightGlossaryIndex(df=glossary_df) if not glossary_df.empty else None
-            
+            if glossary_df.empty:
+                self.log.error("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다.")
+                raise RuntimeError("용어집 로드 실패")
+            self.glossary = LightweightGlossaryIndex(df=glossary_df)
+
+            # 사양값DB 로드 (umgv_fin 테이블)
             specdb_df = self.pg_loader.load_specdb_from_db()
-            self.specdb = LightweightSpecDBIndex(df=specdb_df) if not specdb_df.empty else None
+            if specdb_df.empty:
+                self.log.error("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다.")
+                raise RuntimeError("사양값DB 로드 실패")
+            self.specdb = LightweightSpecDBIndex(df=specdb_df)
         else:
             # 파일 모드: 로컬 파일에서 로드
             self.log.info("데이터 소스: 파일 모드")
-            
+            self.pg_loader = None
+
             gpath = glossary_path or self.config.glossary_path
-            self.glossary = LightweightGlossaryIndex(file_path=gpath) if gpath and os.path.exists(gpath) else None
-            
+            if not gpath or not os.path.exists(gpath):
+                self.log.error(f"용어집 파일 없음: {gpath}")
+                raise RuntimeError(f"용어집 파일 없음: {gpath}")
+            self.glossary = LightweightGlossaryIndex(file_path=gpath)
+
             spath = specdb_path or self.config.specdb_path
-            self.specdb = LightweightSpecDBIndex(file_path=spath) if spath and os.path.exists(spath) else None
+            if not spath or not os.path.exists(spath):
+                self.log.error(f"사양값DB 파일 없음: {spath}")
+                raise RuntimeError(f"사양값DB 파일 없음: {spath}")
+            self.specdb = LightweightSpecDBIndex(file_path=spath)
+
+            # 파일 모드에서 임베딩이 필요한 경우에만 DB 연결 시도
+            if self.config.use_precomputed_embeddings:
+                try:
+                    self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
+                except Exception as e:
+                    self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
+                    self.pg_loader = None
 
         # SynonymManager 초기화 (v2에서 추가 - DB 기반 동의어 관리)
         self.synonym_manager = SynonymManager()
@@ -4655,90 +4667,9 @@ class POSExtractorV52:
         # 템플릿 필터링
         filtered_df = self.filter_template_by_files(template_df, pos_files)
         if filtered_df.empty:
-            self.log.warning("템플릿 필터링 결과 없음. HTML 키 기반 자동 템플릿 생성")
-            # HTML에서 직접 키-값 쌍을 추출하여 템플릿 생성
-            auto_templates = []
-            for fname in pos_files:
-                doknr = self.extract_doknr_from_filename(fname)
-                if not doknr:
-                    continue
-                
-                hull = doknr.split('-')[0]
-                html_path = os.path.join(pos_folder, fname)
-                
-                # HTML 파싱하여 키 추출
-                parser = self._get_parser(html_path)
-                
-                # 추출 가능한 키-값 쌍 확인
-                extracted_keys = set()
-                # 모호하거나 너무 짧은 키 제외
-                ambiguous_keys = {
-                    'NO.', 'NO', 'RATE', 'MODE', 'ITEM', 'NAME', 
-                    'SPEC', 'SIZE', 'DATE', 'REV.', 'INSULATION',
-                    'SPEC.CODENO.', 'SPEC.CODE', 'DESCRIPTION'
-                }
-                
-                for kv in parser.kv_pairs:
-                    key = kv['key'].strip()
-                    if key and len(key) >= 4 and len(key) <= 60:  # 최소 4자, 최대 60자
-                        key_upper = key.upper()
-                        # 의미있는 키만 선택
-                        if not key.isdigit() and not re.match(r'^[\d.,\-+%]+$', key):
-                            # 모호한 키 제외
-                            if key_upper not in ambiguous_keys:
-                                extracted_keys.add(key)
-                
-                # 핵심 사양 키워드 (정확 매칭 우선)
-                core_spec_patterns = [
-                    ('OUTPUT', 'kW'), ('POWER OUTPUT', 'kW'), ('RATED OUTPUT', 'kW'),
-                    ('RATING OF ELECTRIC MOTOR', 'kW'), ('MOTOR OUTPUT', 'kW'),
-                    ('CAPACITY', 'm3/h'), ('FLOW RATE', 'm3/h'), ('CARGO LOADING', 'm3/h'),
-                    ('QUANTITY', 'EA'), ('NO. OF UNIT', 'EA'), ('NO. OF SET', 'EA'),
-                    ('TYPE', ''), ('EQUIPMENT TYPE', ''), 
-                    ('POWER SOURCE', ''), ('ELECTRIC SOURCE', ''),
-                    ('MOTOR SHAFT SPEED', 'rpm'), ('SHAFT SPEED', 'rpm'),
-                    ('INSULATION THICKNESS', 'mm'), 
-                    ('DENSITY', 'kg/m³'), ('FOAM DENSITY', 'kg/m³'),
-                    ('HEAD', 'm'), ('TOTAL HEAD', 'm'),
-                    ('PRESSURE', 'bar'), ('WORKING PRESSURE', 'bar'),
-                    ('NOMINAL THRUST', ''), ('BLADE', ''), ('PRIME MOVER', ''),
-                    ('DRIVEN BY', ''), ('MATERIALS', ''), ('LOCATION', ''),
-                ]
-                
-                for key in extracted_keys:
-                    key_upper = key.upper().strip()
-                    key_normalized = re.sub(r'[_\-\s]+', ' ', key_upper)
-                    
-                    # 정확 매칭 또는 부분 매칭
-                    matched_spec = None
-                    matched_uom = ''
-                    
-                    for spec_pattern, uom in core_spec_patterns:
-                        spec_normalized = re.sub(r'[_\-\s]+', ' ', spec_pattern)
-                        # 정확 매칭
-                        if key_normalized == spec_normalized:
-                            matched_spec = key
-                            matched_uom = uom
-                            break
-                        # 키가 사양명으로 시작 (예: "Capacity (m3/h)" → "Capacity")
-                        if key_normalized.startswith(spec_normalized + ' ') or \
-                           key_normalized.startswith(spec_normalized + '('):
-                            matched_spec = key
-                            matched_uom = uom
-                            break
-                    
-                    if matched_spec:
-                        auto_templates.append({
-                            'pmg_desc': '', 'pmg_code': '',
-                            'umg_desc': '', 'umg_code': '',
-                            'mat_attr_desc': '',
-                            'extwg': '', 'matnr': f'{hull}A',
-                            'doknr': doknr,
-                            'umgv_desc': matched_spec, 'umgv_code': '', 'umgv_uom': matched_uom
-                        })
-            
-            filtered_df = pd.DataFrame(auto_templates)
-            self.log.info("HTML 키 기반 자동 템플릿: %d rows", len(filtered_df))
+            self.log.error("템플릿 필터링 결과 없음: POS 파일에 대한 템플릿 정보가 없습니다.")
+            self.log.error("추출 대상 사양 항목이 불명확하므로 작업을 종료합니다.")
+            return [], {}
         
         # 추출 실행
         all_results = []
@@ -4792,9 +4723,9 @@ class POSExtractorV52:
                 return True
             
             file_rows = filtered_df[filtered_df.apply(match_file_template, axis=1)]
-            
+
             if file_rows.empty:
-                self.log.debug("템플릿 없음: %s (hull=%s, POS=%s)", fname, file_hull, file_pos_num)
+                self.log.warning("해당 POS의 템플릿 정보 없음: %s (hull=%s, POS=%s), 다음 파일로 넘어갑니다.", fname, file_hull, file_pos_num)
                 continue
             
             self.log.info("처리 중: %s (hull=%s, %d specs)", fname, file_hull, len(file_rows))
