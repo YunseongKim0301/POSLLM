@@ -7707,6 +7707,7 @@ class POSExtractorV61:
             pg_loader=self.pg_loader,
             logger=self.log
         )
+        self._hint_engine_initialized = True
         self.log.info("ReferenceHintEngine 초기화 완료")
 
         # SynonymManager 초기화 (Lazy loading)
@@ -7810,6 +7811,7 @@ class POSExtractorV61:
             pg_loader=self.pg_loader,
             logger=self.log
         )
+        self._hint_engine_initialized = True
         self.log.info("ReferenceHintEngine 초기화 완료")
 
         # SynonymManager 초기화 (Lazy loading)
