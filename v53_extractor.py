@@ -7606,12 +7606,15 @@ class POSExtractorV52:
                 timeout=self.config.ollama_timeout,
                 logger=self.log,
                 llm_client=self.llm_client,  # UnifiedLLMClient 전달
-                use_voting=self.config.vote_enabled  # Config의 voting 설정 사용
+                use_voting=self.config.vote_enabled,  # Config의 voting 설정 사용
+                glossary=self.glossary,  # v53: glossary 전달
+                enable_enhanced_chunk_selection=True,  # v53: Enhanced chunk selection
+                use_dynamic_knowledge=True  # v53: 동적 지식 활성화
             )
             voting_status = "Voting 활성화" if self.config.vote_enabled else "단일 호출"
             self.log.info("LLM Fallback 초기화: %s (ports: %s, %s)",
                          self.config.ollama_model, self.config.ollama_ports, voting_status)
-        
+
         # 통계
         self.stats = {
             'total': 0,
@@ -7622,9 +7625,13 @@ class POSExtractorV52:
             'keyword_fallback': 0,
             'no_reference': 0,
         }
-        
+
         # 파서 캐시
         self._parser_cache: Dict[str, HTMLChunkParser] = {}
+
+        # v53 Enhanced: PostgresKnowledgeLoader 주입 (모드 초기화 후)
+        # pg_knowledge_loader는 _init_*_mode()에서 생성됨
+        self.pg_knowledge_loader = None  # 초기화, _init_*_mode에서 설정됨
     
     def _init_light_mode(self, glossary_path: str, specdb_path: str):
         """
@@ -7686,48 +7693,34 @@ class POSExtractorV52:
                 f"단위 {len(self.pg_knowledge_loader.unit_reverse)}개, "
                 f"약어 {len(self.pg_knowledge_loader.abbreviations)}개"
             )
-        else:
-            # 파일 모드: 로컬 파일에서 로드
-            self.log.info("데이터 소스: 파일 모드")
-            self.pg_loader = None
 
-            gpath = glossary_path or self.config.glossary_path
-            if not gpath or not os.path.exists(gpath):
-                self.log.error(f"용어집 파일 없음: {gpath}")
-                raise RuntimeError(f"용어집 파일 없음: {gpath}")
-            self.glossary = LightweightGlossaryIndex(file_path=gpath)
+        # ReferenceHintEngine 초기화 (v53: 용어집/사양값DB 참조)
+        self.hint_engine = ReferenceHintEngine(
+            glossary=self.glossary,
+            specdb=self.specdb,
+            pg_loader=self.pg_loader,
+            logger=self.log
+        )
+        self.log.info("ReferenceHintEngine 초기화 완료")
 
-            spath = specdb_path or self.config.specdb_path
-            if not spath or not os.path.exists(spath):
-                self.log.error(f"사양값DB 파일 없음: {spath}")
-                raise RuntimeError(f"사양값DB 파일 없음: {spath}")
-            self.specdb = LightweightSpecDBIndex(file_path=spath)
-
-            # 파일 모드에서 임베딩이 필요한 경우에만 DB 연결 시도
-            if self.config.use_precomputed_embeddings:
-                try:
-                    self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
-                except Exception as e:
-                    self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
-                    self.pg_loader = None
-        
-        # SynonymManager 초기화 (Lazy loading으로 변경 - 초기화 시간 단축)
+        # SynonymManager 초기화 (Lazy loading)
         self.synonym_manager = None
         self._synonym_manager_initialized = False
-        self.log.info("SynonymManager: Lazy loading 모드 (첫 사용 시 초기화)")
+        self.log.info("SynonymManager: Lazy loading 모드")
 
-        # ReferenceHintEngine 초기화 (Lazy loading - 첫 사용 시 초기화)
-        self.hint_engine = None
-        self._hint_engine_initialized = False
-        self.log.info("ReferenceHintEngine: Lazy loading 모드 (첫 사용 시 초기화)")
-
-        # SemanticMatcher (Lazy loading - 첫 사용 시 초기화)
+        # SemanticMatcher (Lazy loading)
         self.semantic_matcher = None
         self._semantic_matcher_initialized = False
-        self.log.info("SemanticMatcher: Lazy loading 모드 (첫 사용 시 초기화)")
-        
+        self.log.info("SemanticMatcher: Lazy loading 모드")
+
+        # v53 Enhanced: LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
+        if self.llm_fallback and self.pg_knowledge_loader:
+            self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
+            self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
+            self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
+
         elapsed = time.time() - start
-        self.log.info("Light 모드 초기화 완료: %.2f초", elapsed)
+        self.log.info(f"Light 모드 초기화 완료: {elapsed:.2f}초")
 
     def _init_verify_mode(self, glossary_path: str, specdb_path: str):
         """
@@ -7751,78 +7744,92 @@ class POSExtractorV52:
 
     def _init_full_mode(self, glossary_path: str, specdb_path: str):
         """
-        Full 모드 초기화
-        
-        DATA_SOURCE_MODE에 따라:
-        - "file": 파일에서 용어집/사양값DB 로드
-        - "db": PostgreSQL에서 용어집/사양값DB 로드
+        Full 모드 초기화 (v53 Enhanced: PostgreSQL 전용)
+
+        v53 변경사항:
+        - 파일 모드 제거 (DB 모드만 지원)
+        - PostgresKnowledgeLoader 초기화 (동적 지식)
         """
-        self.log.info("Full 모드 초기화 시작")
+        self.log.info("Full 모드 초기화 시작 (v53 Enhanced)")
         start = time.time()
 
-        # DATA_SOURCE_MODE에 따라 용어집/사양값DB 로드
-        if self.config.data_source_mode == "db":
-            # DB 모드: PostgreSQL에서 로드
-            self.log.info("데이터 소스: DB 모드")
+        # === DB 모드 전용 (파일 모드 제거) ===
+        if self.config.data_source_mode != "db":
+            self.log.error("v53 Enhanced는 DB 모드만 지원합니다.")
+            raise RuntimeError(
+                "파일 모드는 더 이상 지원되지 않습니다. "
+                "config.data_source_mode='db'로 설정하세요."
+            )
 
-            # pos_embedding DB 연결
-            try:
-                self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
-            except Exception as e:
-                self.log.error("PostgreSQL 연결 실패: %s", e)
-                self.log.error("DB 모드에서는 PostgreSQL 연결이 필수입니다. 프로그램을 종료합니다.")
-                raise RuntimeError(f"PostgreSQL 연결 실패: {e}")
+        self.log.info("데이터 소스: DB 모드 (PostgreSQL)")
 
-            # 용어집 로드 (pos_dict 테이블)
-            glossary_df = self.pg_loader.load_glossary_from_db()
-            if glossary_df.empty:
-                self.log.error("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다.")
-                raise RuntimeError("용어집 로드 실패")
-            self.glossary = LightweightGlossaryIndex(df=glossary_df)
+        # PostgreSQL 연결
+        try:
+            self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
+        except Exception as e:
+            self.log.error(f"PostgreSQL 연결 실패: {e}")
+            raise RuntimeError(f"PostgreSQL 연결 필수: {e}")
 
-            # 사양값DB 로드 (umgv_fin 테이블)
-            specdb_df = self.pg_loader.load_specdb_from_db()
-            if specdb_df.empty:
-                self.log.error("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다.")
-                raise RuntimeError("사양값DB 로드 실패")
-            self.specdb = LightweightSpecDBIndex(df=specdb_df)
+        # 용어집 로드 (pos_dict 테이블)
+        glossary_df = self.pg_loader.load_glossary_from_db()
+        if glossary_df.empty:
+            self.log.error("용어집(pos_dict) 로드 실패")
+            raise RuntimeError("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다")
+        self.glossary = LightweightGlossaryIndex(df=glossary_df)
+        self.log.info(f"용어집 로드 완료: {len(glossary_df)}행")
+
+        # 사양값DB 로드 (umgv_fin 테이블)
+        specdb_df = self.pg_loader.load_specdb_from_db()
+        if specdb_df.empty:
+            self.log.error("사양값DB(umgv_fin) 로드 실패")
+            raise RuntimeError("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다")
+        self.specdb = LightweightSpecDBIndex(df=specdb_df)
+        self.log.info(f"사양값DB 로드 완료: {len(specdb_df)}행")
+
+        # === 동적 지식 로더 초기화 (v53 Enhanced) ===
+        self.pg_knowledge_loader = PostgresKnowledgeLoader(
+            conn=self.pg_loader.conn,  # 기존 연결 재사용
+            logger=self.log
+        )
+
+        # 지식 로드 (1회, 수초 소요)
+        if not self.pg_knowledge_loader.load_all():
+            self.log.warning("동적 지식 로드 실패, 기본 기능만 사용")
         else:
-            # 파일 모드: 로컬 파일에서 로드
-            self.log.info("데이터 소스: 파일 모드")
-            self.pg_loader = None
+            self.log.info(
+                f"동적 지식 로드 완료: "
+                f"동의어 {len(self.pg_knowledge_loader.synonym_reverse)}개, "
+                f"단위 {len(self.pg_knowledge_loader.unit_reverse)}개, "
+                f"약어 {len(self.pg_knowledge_loader.abbreviations)}개"
+            )
 
-            gpath = glossary_path or self.config.glossary_path
-            if not gpath or not os.path.exists(gpath):
-                self.log.error(f"용어집 파일 없음: {gpath}")
-                raise RuntimeError(f"용어집 파일 없음: {gpath}")
-            self.glossary = LightweightGlossaryIndex(file_path=gpath)
+        # ReferenceHintEngine 초기화 (v53: 용어집/사양값DB 참조)
+        self.hint_engine = ReferenceHintEngine(
+            glossary=self.glossary,
+            specdb=self.specdb,
+            pg_loader=self.pg_loader,
+            logger=self.log
+        )
+        self.log.info("ReferenceHintEngine 초기화 완료")
 
-            spath = specdb_path or self.config.specdb_path
-            if not spath or not os.path.exists(spath):
-                self.log.error(f"사양값DB 파일 없음: {spath}")
-                raise RuntimeError(f"사양값DB 파일 없음: {spath}")
-            self.specdb = LightweightSpecDBIndex(file_path=spath)
-
-            # 파일 모드에서 임베딩이 필요한 경우에만 DB 연결 시도
-            if self.config.use_precomputed_embeddings:
-                try:
-                    self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
-                except Exception as e:
-                    self.log.warning("PostgreSQL 연결 실패 (임베딩 사용 불가): %s", e)
-                    self.pg_loader = None
-
-        # SynonymManager 초기화 (Lazy loading으로 변경 - 초기화 시간 단축)
+        # SynonymManager 초기화 (Lazy loading)
         self.synonym_manager = None
         self._synonym_manager_initialized = False
-        self.log.info("SynonymManager: Lazy loading 모드 (첫 사용 시 초기화)")
+        self.log.info("SynonymManager: Lazy loading 모드")
 
-        # SemanticMatcher (Lazy loading - 첫 사용 시 초기화)
+        # SemanticMatcher (Lazy loading)
         self.semantic_matcher = None
         self._semantic_matcher_initialized = False
-        self.log.info("SemanticMatcher: Lazy loading 모드 (첫 사용 시 초기화)")
-        
+        self.log.info("SemanticMatcher: Lazy loading 모드")
+
+        # v53 Enhanced: LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
+        if self.llm_fallback and self.pg_knowledge_loader:
+            self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
+            self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
+            self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
+
         elapsed = time.time() - start
-        self.log.info("Full 모드 초기화 완료: %.2f초", elapsed)
+        self.log.info(f"Full 모드 초기화 완료: {elapsed:.2f}초")
     
     def _get_parser(self, file_path: str) -> HTMLChunkParser:
         """HTML 파서 캐시 조회/생성"""
