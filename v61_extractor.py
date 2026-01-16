@@ -8160,7 +8160,16 @@ class POSExtractorV61:
         if HAS_BGE_M3:
             try:
                 self.log.info("BGE-M3 모델 로딩 시작...")
-                self.bge_m3_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+
+                # 로컬 모델 경로 우선 시도
+                local_model_path = "/workspace/bge-m3"
+                if os.path.exists(local_model_path):
+                    self.log.info(f"로컬 모델 사용: {local_model_path}")
+                    self.bge_m3_model = BGEM3FlagModel(local_model_path, use_fp16=True)
+                else:
+                    self.log.info("HuggingFace Hub에서 다운로드: BAAI/bge-m3")
+                    self.bge_m3_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+
                 self.log.info("BGE-M3 모델 로딩 완료")
 
                 # PostgresKnowledgeLoader에 모델 주입
