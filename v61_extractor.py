@@ -90,6 +90,12 @@ try:
 except ImportError:
     HAS_SENTENCE_TRANSFORMER = False
 
+try:
+    from FlagEmbedding import BGEM3FlagModel
+    HAS_BGE_M3 = True
+except ImportError:
+    HAS_BGE_M3 = False
+
 
 # #############################################################################
 # ██████╗ ██╗   ██╗███╗   ██╗    ███╗   ███╗ ██████╗ ██████╗ ███████╗
@@ -3591,10 +3597,13 @@ class ReferenceHintEngine:
                 # embedding_key 생성: hull_pmg_desc_umg_desc_mat_attr_desc
                 query_text = f"{hull} {spec_name}"
 
+                # BGE-M3 모델 가져오기 (있으면 사용, 없으면 None)
+                embedding_model = getattr(self.pg_loader, 'embedding_model', None)
+
                 similar_specs = self.pg_loader.search_by_key_with_fallback(
                     search_key=f"{hull}_{spec_name}",  # 간단한 키
                     query_text=query_text,
-                    embedding_model=None,  # TODO: BGE-M3 모델 주입
+                    embedding_model=embedding_model,
                     top_k=3,
                     similarity_threshold=0.7
                 )
@@ -8145,6 +8154,26 @@ class POSExtractorV61:
                 self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
                 self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
                 self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
+
+        # BGE-M3 Embedding Model 초기화
+        self.bge_m3_model = None
+        if HAS_BGE_M3:
+            try:
+                self.log.info("BGE-M3 모델 로딩 시작...")
+                self.bge_m3_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+                self.log.info("BGE-M3 모델 로딩 완료")
+
+                # PostgresKnowledgeLoader에 모델 주입
+                if self.pg_knowledge_loader:
+                    self.pg_knowledge_loader.embedding_model = self.bge_m3_model
+                    self.log.info("PostgresKnowledgeLoader에 BGE-M3 모델 주입 완료")
+            except Exception as e:
+                self.log.warning(f"BGE-M3 모델 로딩 실패: {e}")
+                self.log.warning("임베딩 검색 없이 계속 진행합니다")
+                self.bge_m3_model = None
+        else:
+            self.log.warning("FlagEmbedding 패키지가 설치되지 않음. 임베딩 검색 비활성화")
+            self.log.warning("설치 방법: pip install FlagEmbedding")
 
         # 통계
         self.stats = {
