@@ -3387,6 +3387,9 @@ class ExtractionHint:
     # 유사 POS 힌트
     similar_pos_hints: List[Dict] = field(default_factory=list)  # 유사 POS 정보
 
+    # 메타데이터 (신뢰도 평가용)
+    metadata: Dict = field(default_factory=dict)  # 힌트 출처 및 신뢰도 정보
+
 
 class ReferenceHintEngine:
     """
@@ -3520,14 +3523,26 @@ class ReferenceHintEngine:
         return hull_hints
     
     def _build_hint(
-        self, 
-        spec_name: str, 
+        self,
+        spec_name: str,
         hull: str,
         historical_values: List[str] = None
     ) -> ExtractionHint:
-        """개별 사양의 힌트 구성"""
+        """
+        개별 사양의 힌트 구성 (임베딩 기반 유사 사양 검색 포함)
+
+        개선사항:
+        1. pos_embedding 활용하여 유사 사양 검색
+        2. 상세 로그 기록 (참조 row, 유사도)
+        3. 힌트 신뢰도 메타데이터 추가
+        """
         hint = ExtractionHint(spec_name=spec_name)
-        
+        hint_metadata = {
+            'glossary_source': None,
+            'embedding_sources': [],
+            'historical_count': 0
+        }
+
         # 용어집 힌트
         glossary_entries = self._glossary_index.get(spec_name.upper(), [])
         if glossary_entries:
@@ -3537,20 +3552,81 @@ class ReferenceHintEngine:
                 if entry.get('hull') == hull:
                     matched = entry
                     break
-            
+
             if not matched:
                 matched = glossary_entries[0]
-            
+
             hint.section_num = matched.get('section_num', '')
             hint.table_text = matched.get('table_text', '')
             hint.value_format = matched.get('value_format', '')
             hint.pos_umgv_desc = matched.get('pos_umgv_desc', '')
-        
-        # 과거 값
+
+            hint_metadata['glossary_source'] = {
+                'hull': matched.get('hull', ''),
+                'extwg': matched.get('extwg', ''),
+                'section': hint.section_num
+            }
+
+            self.log.debug(
+                f"[HINT] Glossary: spec={spec_name}, hull={matched.get('hull')}, "
+                f"section={hint.section_num}, pos_desc={hint.pos_umgv_desc}"
+            )
+
+        # 과거 값 (사양값DB)
         if historical_values:
             hint.historical_values = historical_values[:10]  # 최대 10개
             hint.value_patterns = self._extract_value_patterns(historical_values)
-        
+            hint_metadata['historical_count'] = len(historical_values)
+
+            self.log.debug(
+                f"[HINT] Historical: spec={spec_name}, hull={hull}, "
+                f"values_count={len(historical_values)}, "
+                f"samples={historical_values[:3]}"
+            )
+
+        # 임베딩 기반 유사 사양 검색 (새로 추가)
+        if self.pg_loader:
+            try:
+                # search_key 생성: hull_pmg_code_umg_code_extwg
+                # embedding_key 생성: hull_pmg_desc_umg_desc_mat_attr_desc
+                query_text = f"{hull} {spec_name}"
+
+                similar_specs = self.pg_loader.search_by_key_with_fallback(
+                    search_key=f"{hull}_{spec_name}",  # 간단한 키
+                    query_text=query_text,
+                    embedding_model=None,  # TODO: BGE-M3 모델 주입
+                    top_k=3,
+                    similarity_threshold=0.7
+                )
+
+                if similar_specs:
+                    for idx, similar in enumerate(similar_specs):
+                        embedding_key = similar.get('embedding_key', '')
+                        similarity = similar.get('similarity', 0.0)
+
+                        hint_metadata['embedding_sources'].append({
+                            'embedding_key': embedding_key,
+                            'similarity': similarity,
+                            'rank': idx + 1
+                        })
+
+                        self.log.debug(
+                            f"[HINT] Embedding: spec={spec_name}, "
+                            f"similar_key={embedding_key[:50]}..., "
+                            f"similarity={similarity:.3f}"
+                        )
+
+                        # 유사 사양의 값도 힌트에 추가 (최대 3개)
+                        similar_value = similar.get('umgv_value_edit', '')
+                        if similar_value and similar_value not in hint.historical_values:
+                            hint.historical_values.append(similar_value)
+
+            except Exception as e:
+                self.log.debug(f"[HINT] Embedding search failed: {e}")
+
+        # 힌트 메타데이터 저장 (신뢰도 평가용)
+        hint.metadata = hint_metadata
+
         return hint
     
     def _extract_value_patterns(self, values: List[str]) -> List[str]:
@@ -3615,15 +3691,179 @@ class ReferenceHintEngine:
         
         return hint
     
+    def evaluate_hint_confidence(
+        self,
+        hint: ExtractionHint,
+        chunk_text: str,
+        extracted_value: str = ""
+    ) -> Dict[str, float]:
+        """
+        힌트 신뢰도 평가 (하이브리드 접근)
+
+        Rule 기반 평가:
+        1. 빈도 기반: 힌트의 historical_value가 chunk에 있는가?
+        2. 거리 기반: 추출된 값과 힌트 값의 차이가 합리적인가?
+        3. 구조 기반: 원본 사양명이 chunk에 있으면 동의어 불필요
+
+        Returns:
+            {
+                'overall': 0.0~1.0 (전체 신뢰도),
+                'frequency_score': 0.0~1.0,
+                'distance_score': 0.0~1.0,
+                'structure_score': 0.0~1.0,
+                'should_use': True/False
+            }
+        """
+        scores = {
+            'overall': 0.0,
+            'frequency_score': 0.0,
+            'distance_score': 0.0,
+            'structure_score': 0.0,
+            'should_use': False
+        }
+
+        if not hint or not chunk_text:
+            return scores
+
+        chunk_upper = chunk_text.upper()
+        spec_name_upper = hint.spec_name.upper()
+
+        # 1. 빈도 기반 평가: 힌트 값이 chunk에 존재하는가?
+        if hint.historical_values:
+            matched_count = 0
+            for hist_val in hint.historical_values[:5]:  # 최대 5개만 체크
+                hist_upper = hist_val.upper()
+                # 완전 일치 또는 부분 일치
+                if hist_upper in chunk_upper or chunk_upper.find(hist_upper) >= 0:
+                    matched_count += 1
+
+            scores['frequency_score'] = matched_count / min(5, len(hint.historical_values))
+
+        # 2. 거리 기반 평가: 추출된 값과 힌트 값의 차이
+        if extracted_value and hint.historical_values:
+            try:
+                # 숫자 값인 경우 수치 비교
+                extracted_num = float(re.sub(r'[^\d.-]', '', extracted_value))
+                hint_nums = []
+
+                for hist_val in hint.historical_values[:3]:
+                    num_match = re.search(r'([-+]?\d+(?:\.\d+)?)', hist_val)
+                    if num_match:
+                        hint_nums.append(float(num_match.group(1)))
+
+                if hint_nums:
+                    # 가장 가까운 힌트 값과의 차이
+                    min_diff = min(abs(extracted_num - h) for h in hint_nums)
+                    avg_hint = sum(hint_nums) / len(hint_nums)
+
+                    # 차이 비율 계산 (10% 이내면 높은 점수)
+                    if avg_hint != 0:
+                        diff_ratio = min_diff / abs(avg_hint)
+                        scores['distance_score'] = max(0, 1.0 - diff_ratio)
+                    else:
+                        scores['distance_score'] = 1.0 if min_diff == 0 else 0.5
+
+            except (ValueError, ZeroDivisionError):
+                # 텍스트 값이거나 파싱 실패 시 문자열 유사도
+                if extracted_value.upper() in [h.upper() for h in hint.historical_values]:
+                    scores['distance_score'] = 1.0
+                else:
+                    scores['distance_score'] = 0.3  # 중립
+
+        # 3. 구조 기반 평가: 원본 사양명 vs 동의어
+        if spec_name_upper in chunk_upper:
+            # 원본 사양명이 이미 chunk에 있으면 높은 점수
+            scores['structure_score'] = 1.0
+        elif hint.pos_umgv_desc and hint.pos_umgv_desc.upper() in chunk_upper:
+            # 동의어가 chunk에 있으면 중간 점수
+            scores['structure_score'] = 0.7
+        else:
+            # 둘 다 없으면 낮은 점수
+            scores['structure_score'] = 0.3
+
+        # 전체 신뢰도 계산 (가중 평균)
+        weights = {
+            'frequency_score': 0.4,
+            'distance_score': 0.3,
+            'structure_score': 0.3
+        }
+
+        scores['overall'] = sum(
+            scores[key] * weights[key]
+            for key in weights.keys()
+        )
+
+        # 사용 여부 결정 (임계값: 0.5)
+        scores['should_use'] = scores['overall'] >= 0.5
+
+        # 로그 기록
+        self.log.debug(
+            f"[HINT_EVAL] spec={hint.spec_name}, "
+            f"overall={scores['overall']:.2f}, "
+            f"freq={scores['frequency_score']:.2f}, "
+            f"dist={scores['distance_score']:.2f}, "
+            f"struct={scores['structure_score']:.2f}, "
+            f"should_use={scores['should_use']}"
+        )
+
+        return scores
+
+    def filter_hints_by_confidence(
+        self,
+        hint: ExtractionHint,
+        chunk_text: str,
+        min_confidence: float = 0.5
+    ) -> ExtractionHint:
+        """
+        신뢰도 기반 힌트 필터링
+
+        신뢰도가 낮은 힌트는 제거하거나 약화시킵니다.
+
+        Args:
+            hint: 원본 힌트
+            chunk_text: 추출 대상 chunk
+            min_confidence: 최소 신뢰도 (기본 0.5)
+
+        Returns:
+            필터링된 힌트 (신뢰도 낮으면 일부 정보 제거)
+        """
+        if not hint:
+            return hint
+
+        # 신뢰도 평가 (extracted_value 없이 사전 평가)
+        confidence = self.evaluate_hint_confidence(hint, chunk_text, "")
+
+        if confidence['should_use']:
+            # 신뢰도 높으면 그대로 사용
+            self.log.debug(f"[HINT_FILTER] Using hint: confidence={confidence['overall']:.2f}")
+            return hint
+        else:
+            # 신뢰도 낮으면 일부 정보만 사용
+            filtered_hint = ExtractionHint(spec_name=hint.spec_name)
+
+            # section_num과 value_format은 유지 (안전한 정보)
+            filtered_hint.section_num = hint.section_num
+            filtered_hint.value_format = hint.value_format
+
+            # historical_values는 제거 (오히려 혼란 가능)
+            # pos_umgv_desc도 제거 (동의어가 맞지 않을 수 있음)
+
+            self.log.debug(
+                f"[HINT_FILTER] Filtered hint: confidence={confidence['overall']:.2f}, "
+                f"removed historical_values and pos_umgv_desc"
+            )
+
+            return filtered_hint
+
     def get_section_search_hints(self, spec_name: str) -> List[str]:
         """
         섹션 검색 힌트 반환
-        
+
         section_num에서 검색에 유용한 키워드 추출
         예: "2.2.1 Main particulars" → ["2.2.1", "Main particulars"]
         """
         hints = []
-        
+
         glossary_entries = self._glossary_index.get(spec_name.upper(), [])
         for entry in glossary_entries:
             section = entry.get('section_num', '')
@@ -3632,12 +3872,12 @@ class ReferenceHintEngine:
                 sec_match = re.match(r'^(\d+(?:\.\d+)*)', section)
                 if sec_match:
                     hints.append(sec_match.group(1))
-                
+
                 # 섹션 제목 추출 (예: "Main particulars")
                 title_match = re.search(r'\d+(?:\.\d+)*\s+(.+)', section)
                 if title_match:
                     hints.append(title_match.group(1).strip())
-        
+
         return list(set(hints))
     
     def get_similar_pos_hints(
