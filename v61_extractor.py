@@ -3831,11 +3831,15 @@ class HTMLChunkParser:
         self.table_structures = [] # v2에서 추가: 테이블 구조 정보 (헤더, 데이터 행 위치)
         self.kv_pairs = []         # 키-값 쌍 리스트
         self.text_chunks = []
-        
+
         if file_path and os.path.exists(file_path):
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 self.html_content = f.read()
-        
+
+        # HTML 정규화: <sup>O</sup>C → °C
+        if self.html_content:
+            self.html_content = self._normalize_html_units(self.html_content)
+
         if self.html_content:
             self._parse()
     
@@ -3844,12 +3848,40 @@ class HTMLChunkParser:
         if not HAS_BS4:
             logger.warning("BeautifulSoup 미설치")
             return
-        
+
         self.soup = BeautifulSoup(self.html_content, 'html.parser')
         self._extract_tables()
         self._extract_kv_pairs()
         self._extract_text_chunks()
-    
+
+    def _normalize_html_units(self, html_content: str) -> str:
+        """
+        HTML 단위 표기 정규화
+
+        변환 패턴:
+        - <sup>O</sup>C → °C
+        - O C → °C
+        - OC → °C (단, 단어 경계에서만)
+
+        Args:
+            html_content: 원본 HTML
+
+        Returns:
+            정규화된 HTML
+        """
+        # Pattern 1: <sup>O</sup>C 또는 <sup>o</sup>C → °C
+        html_content = re.sub(r'<sup>\s*[Oo]\s*</sup>\s*C', '°C', html_content)
+
+        # Pattern 2: O C 또는 o C (공백 포함) → °C
+        html_content = re.sub(r'(?<!\w)[Oo]\s+C(?!\w)', '°C', html_content)
+
+        # Pattern 3: OC 또는 oC (단어 경계) → °C
+        # 주의: "DOCUMENT", "PROCEDURE" 같은 단어는 건드리지 않음
+        html_content = re.sub(r'(?<![A-Za-z])OC(?![A-Za-z])', '°C', html_content)
+        html_content = re.sub(r'(?<![A-Za-z])oC(?![A-Za-z])', '°C', html_content)
+
+        return html_content
+
     def _extract_tables(self):
         """테이블 추출 (v2 개선: 구조 정보 포함)"""
         if not self.soup:
@@ -5523,6 +5555,20 @@ class ChunkQualityScorer:
         text_upper = candidate.text.upper()
         spec_upper = spec.spec_name.upper()
 
+        # MAX/MIN 키워드 감지 및 검증
+        is_max_spec = any(kw in spec_upper for kw in ['MAX', 'MAXIMUM', 'UPPER', 'HIGH'])
+        is_min_spec = any(kw in spec_upper for kw in ['MIN', 'MINIMUM', 'LOWER', 'LOW'])
+
+        # Chunk에 반대 키워드가 있으면 강력한 페널티
+        if is_max_spec:
+            # MAX 사양인데 chunk에 MINIMUM/MIN 키워드가 있으면 페널티
+            if re.search(r'\b(MINIMUM|MIN\.?)\b', text_upper):
+                return -0.5  # 강력한 페널티
+        elif is_min_spec:
+            # MIN 사양인데 chunk에 MAXIMUM/MAX 키워드가 있으면 페널티
+            if re.search(r'\b(MAXIMUM|MAX\.?)\b', text_upper):
+                return -0.5  # 강력한 페널티
+
         # Exact match
         if spec_upper in text_upper:
             score += 0.15
@@ -6101,7 +6147,12 @@ class RuleBasedExtractor:
 
         raw_value = raw_value.strip()
 
-        # 숫자+단위 패턴
+        # 괄호 안의 값 추출 (예: "(-163°C)" → "-163", "°C")
+        paren_match = re.match(r'^\(([^)]+)\)$', raw_value)
+        if paren_match:
+            raw_value = paren_match.group(1).strip()
+
+        # 숫자+단위 패턴 (범위 포함: "5 ~ 8", "10-55")
         match = re.match(r'^([0-9.,\-~\s]+)\s*([a-zA-Z°℃%/]+.*)?$', raw_value)
         if match:
             value = match.group(1).strip()
@@ -6112,8 +6163,22 @@ class RuleBasedExtractor:
         if re.match(r'^[0-9.,\-~\s]+$', raw_value):
             return raw_value.strip(), ""
 
-        # 텍스트 값 (숫자 없음)
-        return raw_value, ""
+        # 텍스트+숫자 혼합 (예: "SUS316 BODY", "5 ~ 8 bar")
+        # 숫자가 포함되어 있으면 전체를 값으로 반환
+        if re.search(r'\d', raw_value):
+            # bar, mm, kg 등 단위가 뒤에 있으면 분리
+            unit_match = re.match(r'^(.+?)\s+(bar|mm|kg|kW|RPM|Hz|V|A|°C|degrees?|%|MPa|kPa|m³/h|L/min).*$', raw_value, re.IGNORECASE)
+            if unit_match:
+                return unit_match.group(1).strip(), unit_match.group(2).strip()
+            else:
+                return raw_value, ""
+
+        # 순수 텍스트 값 (숫자 없음, 예: "SUS316 BODY", "STAINLESS STEEL")
+        # 단, 너무 긴 텍스트는 제외 (50자 이하만)
+        if len(raw_value) <= 50:
+            return raw_value, ""
+
+        return "", ""
 
     def _get_spec_name_variants(self, spec_name: str, hint: ExtractionHint = None) -> List[str]:
         """
@@ -7268,6 +7333,30 @@ class LLMFallbackExtractor:
             if hint_parts:
                 hint_section = "\n## 참조 힌트\n" + "\n".join(hint_parts) + "\n"
         
+        # MAX/MIN 키워드 감지
+        spec_name_lower = spec.spec_name.lower()
+        is_max_spec = any(kw in spec_name_lower for kw in ['max', 'maximum', 'upper', 'high'])
+        is_min_spec = any(kw in spec_name_lower for kw in ['min', 'minimum', 'lower', 'low'])
+
+        # 범위 파싱 지시사항
+        range_instruction = ""
+        if is_max_spec:
+            range_instruction = """
+**중요 - 범위 값 처리**:
+- 사양명에 "MAX", "MAXIMUM"이 포함되어 있습니다
+- 문서에 범위 표기(예: "10 - 55", "-20 to 70")가 있으면 **상한값(큰 값)**만 추출하세요
+- 예: "10 - 55 OC" → value: "55", unit: "°C"
+- 예: "-20 to 70 OC" → value: "70", unit: "°C"
+"""
+        elif is_min_spec:
+            range_instruction = """
+**중요 - 범위 값 처리**:
+- 사양명에 "MIN", "MINIMUM"이 포함되어 있습니다
+- 문서에 범위 표기(예: "10 - 55", "-20 to 70")가 있으면 **하한값(작은 값)**만 추출하세요
+- 예: "10 - 55 OC" → value: "10", unit: "°C"
+- 예: "-20 to 70 OC" → value: "-20", unit: "°C"
+"""
+
         prompt = f"""당신은 POS(Purchase Order Specification) 문서에서 사양값을 추출하는 전문가입니다.
 
 ## 추출 대상
@@ -7282,7 +7371,7 @@ class LLMFallbackExtractor:
 
 ## 작업
 위 문서에서 "{spec.spec_name}" 사양의 값을 찾아 추출하세요.
-
+{range_instruction}
 ## 출력 형식 (JSON)
 정확히 다음 형식으로만 응답하세요:
 ```json
@@ -7303,13 +7392,14 @@ class LLMFallbackExtractor:
 
 주의사항:
 1. **필수**: 추출한 값이 위 문서에 정확히 존재하는지 확인하세요. 문서에 없는 값은 절대 만들지 마세요!
-2. 값만 추출하고 사양명은 포함하지 마세요
-3. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
-4. 괄호 안의 숫자도 확인하세요 (예: "(34)mm" → value: "34", unit: "mm")
-5. 여러 값이 있으면 "{spec.spec_name}"에 가장 관련성 높은 것을 선택하세요
-6. 확실하지 않거나 문서에 값이 명확히 없으면 빈 문자열 반환하세요
-7. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
-8. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
+2. **단위 표기**: "OC", "o C", "O C" 등은 모두 섭씨 온도입니다. unit 필드에 "°C" 또는 "degrees"로 정규화하세요.
+3. 값만 추출하고 사양명은 포함하지 마세요
+4. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
+5. 괄호 안의 숫자도 확인하세요 (예: "(34)mm" → value: "34", unit: "mm", "(-163OC)" → value: "-163", unit: "°C")
+6. 여러 값이 있으면 "{spec.spec_name}"에 가장 관련성 높은 것을 선택하세요
+7. 확실하지 않거나 문서에 값이 명확히 없으면 빈 문자열 반환하세요
+8. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
+9. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
    - 대소문자, 띄어쓰기, 특수문자 등을 정확히 보존하세요
    - 예: POS에 "capacity"로 적혀있으면 "capacity", "CAPACITY"로 적혀있으면 "CAPACITY"
 """
