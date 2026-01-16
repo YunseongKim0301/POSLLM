@@ -2639,6 +2639,484 @@ class LightweightSpecDBIndex:
 
 
 # =============================================================================
+# Dynamic Knowledge Base (동적 지식 베이스 - 용어집 기반)
+# =============================================================================
+
+class KnowledgeCacheBuilder:
+    """
+    용어집/사양값DB에서 동적 지식 캐시 생성
+
+    별도 DB 없이 JSON 캐시 파일로 관리:
+    - synonyms_cache.json: umgv_desc ↔ pos_umgv_desc
+    - units_cache.json: umgv_uom ↔ pos_umgv_uom
+    - abbreviations_cache.json: 약어 ↔ 전체 형태
+    """
+
+    CACHE_DIR = "knowledge_base/data"
+
+    @staticmethod
+    def ensure_cache_dir():
+        """캐시 디렉토리 생성"""
+        os.makedirs(KnowledgeCacheBuilder.CACHE_DIR, exist_ok=True)
+
+    @staticmethod
+    def get_cache_path(cache_name: str) -> str:
+        """캐시 파일 경로 반환"""
+        KnowledgeCacheBuilder.ensure_cache_dir()
+        return os.path.join(KnowledgeCacheBuilder.CACHE_DIR, cache_name)
+
+    @staticmethod
+    def build_synonym_cache(glossary_df: pd.DataFrame) -> Dict[str, List[str]]:
+        """
+        용어집에서 동의어 캐시 생성
+
+        Returns:
+            {standard_term: [variant1, variant2, ...]}
+            예: {"OUTPUT": ["POWER OUTPUT", "RATED OUTPUT", "M/E OUTPUT"]}
+        """
+        synonym_map = {}
+        reverse_map = {}
+
+        if glossary_df is None or glossary_df.empty:
+            return synonym_map
+
+        for _, row in glossary_df.iterrows():
+            umgv_desc = norm(row.get('umgv_desc', ''))
+            pos_umgv_desc = norm(row.get('pos_umgv_desc', ''))
+
+            if not umgv_desc:
+                continue
+
+            # 표준명 → 변형들
+            if umgv_desc not in synonym_map:
+                synonym_map[umgv_desc] = []
+
+            # pos_umgv_desc가 있고 다르면 추가
+            if pos_umgv_desc and pos_umgv_desc != umgv_desc:
+                if pos_umgv_desc not in synonym_map[umgv_desc]:
+                    synonym_map[umgv_desc].append(pos_umgv_desc)
+
+            # 역방향 매핑 (변형 → 표준명)
+            if pos_umgv_desc:
+                reverse_map[pos_umgv_desc] = umgv_desc
+
+        # 역방향 매핑도 함께 저장 (검색 편의)
+        result = {
+            'forward': synonym_map,  # 표준 → 변형들
+            'reverse': reverse_map   # 변형 → 표준
+        }
+
+        return result
+
+    @staticmethod
+    def build_unit_cache(glossary_df: pd.DataFrame) -> Dict[str, List[str]]:
+        """
+        용어집에서 단위 변형 캐시 생성
+
+        Returns:
+            {standard_unit: [variant1, variant2, ...]}
+            예: {"°C": ["OC", "oc", "degC"]}
+        """
+        unit_map = {}
+        reverse_map = {}
+
+        # 기본 단위 변형 (하드코딩, 최소한만)
+        basic_variants = {
+            '°C': ['OC', 'oc', 'degC', 'deg C', 'degree C', 'celsius'],
+            'kW': ['KW', 'kw', 'kilowatt', 'kilowatts'],
+            'rpm': ['RPM', 'r/min', 'rev/min', 'revolutions per minute'],
+            'mm': ['MM', 'millimeter', 'millimeters'],
+            'm': ['M', 'meter', 'meters'],
+            'kg': ['KG', 'kilogram', 'kilograms'],
+            'bar': ['BAR', 'Bar'],
+            'L': ['l', 'liter', 'litre', 'liters', 'litres'],
+            'V': ['v', 'volt', 'volts'],
+            'A': ['a', 'amp', 'amps', 'ampere', 'amperes'],
+            'Hz': ['HZ', 'hz', 'hertz'],
+            'MPa': ['MPA', 'mpa', 'megapascal'],
+            'kPa': ['KPA', 'kpa', 'kilopascal'],
+        }
+
+        for standard, variants in basic_variants.items():
+            unit_map[standard] = list(variants)
+            for variant in variants:
+                reverse_map[variant] = standard
+            # 표준 단위 자신도 매핑
+            reverse_map[standard] = standard
+
+        # 용어집에서 추가 변형 학습
+        if glossary_df is not None and not glossary_df.empty:
+            for _, row in glossary_df.iterrows():
+                umgv_uom = norm(row.get('umgv_uom', ''))
+                pos_umgv_uom = norm(row.get('pos_umgv_uom', ''))
+
+                if not umgv_uom:
+                    continue
+
+                # 표준 단위로 정규화 (기본 변형 사전에서 찾기)
+                standard_unit = reverse_map.get(umgv_uom, umgv_uom)
+
+                if standard_unit not in unit_map:
+                    unit_map[standard_unit] = []
+
+                # pos_umgv_uom이 있고 다르면 추가
+                if pos_umgv_uom and pos_umgv_uom != standard_unit:
+                    if pos_umgv_uom not in unit_map[standard_unit]:
+                        unit_map[standard_unit].append(pos_umgv_uom)
+                    reverse_map[pos_umgv_uom] = standard_unit
+
+        result = {
+            'forward': unit_map,
+            'reverse': reverse_map
+        }
+
+        return result
+
+    @staticmethod
+    def build_abbreviation_cache(glossary_df: pd.DataFrame = None) -> Dict[str, List[str]]:
+        """
+        약어 캐시 생성
+
+        Returns:
+            {abbreviation: [full_form1, full_form2, ...]}
+            예: {"M/E": ["Main Engine", "Marine Engine"]}
+        """
+        abbrev_map = {}
+
+        # 기본 약어 (하드코딩, 최소한만)
+        basic_abbrevs = {
+            'M/E': ['Main Engine', 'Marine Engine'],
+            'G/E': ['Generator Engine', 'Generating Engine'],
+            'A/E': ['Auxiliary Engine'],
+            'MCR': ['Maximum Continuous Rating'],
+            'NCR': ['Normal Continuous Rating'],
+            'RPM': ['revolutions per minute', 'rev/min', 'r/min'],
+            'KW': ['kilowatt', 'kW'],
+            'HP': ['horsepower', 'bhp'],
+        }
+
+        abbrev_map.update(basic_abbrevs)
+
+        # 용어집에서 학습 (향후 구현 가능)
+        # pos_umgv_desc에서 "Full Form (ABBREV)" 패턴 추출
+        if glossary_df is not None and not glossary_df.empty:
+            for _, row in glossary_df.iterrows():
+                pos_desc = norm(row.get('pos_umgv_desc', ''))
+                if not pos_desc:
+                    continue
+
+                # 패턴: "Full Form (ABBREV)"
+                match = re.search(r'(.+?)\s*\(([A-Z/]+)\)', pos_desc)
+                if match:
+                    full_form = match.group(1).strip()
+                    abbrev = match.group(2).strip()
+
+                    if abbrev not in abbrev_map:
+                        abbrev_map[abbrev] = []
+                    if full_form not in abbrev_map[abbrev]:
+                        abbrev_map[abbrev].append(full_form)
+
+        return abbrev_map
+
+    @staticmethod
+    def save_cache(cache_data: dict, cache_name: str):
+        """캐시를 JSON 파일로 저장"""
+        cache_path = KnowledgeCacheBuilder.get_cache_path(cache_name)
+        try:
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[WARN] Failed to save cache {cache_name}: {e}")
+
+    @staticmethod
+    def load_cache(cache_name: str) -> dict:
+        """캐시 파일 로드"""
+        cache_path = KnowledgeCacheBuilder.get_cache_path(cache_name)
+        if not os.path.exists(cache_path):
+            return {}
+
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] Failed to load cache {cache_name}: {e}")
+            return {}
+
+    @staticmethod
+    def is_cache_valid(cache_name: str, max_age_hours: int = 24) -> bool:
+        """캐시가 유효한지 확인 (생성된 지 24시간 이내)"""
+        cache_path = KnowledgeCacheBuilder.get_cache_path(cache_name)
+        if not os.path.exists(cache_path):
+            return False
+
+        # 파일 수정 시간 확인
+        mtime = os.path.getmtime(cache_path)
+        age_hours = (time.time() - mtime) / 3600
+
+        return age_hours < max_age_hours
+
+    @staticmethod
+    def rebuild_all_caches(glossary_path: str = None, glossary_df: pd.DataFrame = None):
+        """모든 캐시 재생성"""
+        if glossary_df is None and glossary_path:
+            try:
+                glossary_df = pd.read_excel(glossary_path)
+            except Exception as e:
+                print(f"[ERROR] Failed to load glossary: {e}")
+                return
+
+        print("[INFO] Building synonym cache...")
+        synonym_cache = KnowledgeCacheBuilder.build_synonym_cache(glossary_df)
+        KnowledgeCacheBuilder.save_cache(synonym_cache, 'synonyms_cache.json')
+
+        print("[INFO] Building unit cache...")
+        unit_cache = KnowledgeCacheBuilder.build_unit_cache(glossary_df)
+        KnowledgeCacheBuilder.save_cache(unit_cache, 'units_cache.json')
+
+        print("[INFO] Building abbreviation cache...")
+        abbrev_cache = KnowledgeCacheBuilder.build_abbreviation_cache(glossary_df)
+        KnowledgeCacheBuilder.save_cache(abbrev_cache, 'abbreviations_cache.json')
+
+        print("[INFO] All caches built successfully")
+
+
+class UnitNormalizer:
+    """
+    단위 정규화 (동적 캐시 기반)
+
+    용어집의 umgv_uom ↔ pos_umgv_uom을 활용하여 단위 변형 인식
+    """
+
+    _instance = None
+    _cache_loaded = False
+
+    def __new__(cls):
+        """싱글톤 패턴"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not UnitNormalizer._cache_loaded:
+            self._load_cache()
+            UnitNormalizer._cache_loaded = True
+
+    def _load_cache(self):
+        """캐시 로드"""
+        cache_data = KnowledgeCacheBuilder.load_cache('units_cache.json')
+
+        if not cache_data:
+            # 캐시가 없으면 기본값만 사용
+            print("[WARN] Unit cache not found, using basic variants only")
+            cache_data = KnowledgeCacheBuilder.build_unit_cache(None)
+            KnowledgeCacheBuilder.save_cache(cache_data, 'units_cache.json')
+
+        self.forward_map = cache_data.get('forward', {})
+        self.reverse_map = cache_data.get('reverse', {})
+
+    def normalize(self, unit: str) -> str:
+        """
+        단위를 표준 형태로 정규화
+
+        Args:
+            unit: 입력 단위 (예: "OC", "kw", "RPM")
+
+        Returns:
+            표준 단위 (예: "°C", "kW", "rpm")
+        """
+        if not unit:
+            return unit
+
+        # 직접 매칭
+        if unit in self.reverse_map:
+            return self.reverse_map[unit]
+
+        # 대소문자 무시 검색
+        unit_lower = unit.lower()
+        for variant, standard in self.reverse_map.items():
+            if variant.lower() == unit_lower:
+                return standard
+
+        # 매칭 실패 시 원본 반환
+        return unit
+
+    def get_variants(self, unit: str) -> List[str]:
+        """
+        표준 단위의 모든 변형 반환
+
+        Args:
+            unit: 표준 단위 (예: "°C")
+
+        Returns:
+            변형 리스트 (예: ["OC", "oc", "degC", ...])
+        """
+        standard = self.normalize(unit)
+        return self.forward_map.get(standard, [unit])
+
+    def is_variant_of(self, unit1: str, unit2: str) -> bool:
+        """두 단위가 동일한지 확인 (변형 포함)"""
+        return self.normalize(unit1) == self.normalize(unit2)
+
+
+class FuzzyMatcher:
+    """
+    Fuzzy string matching (동적 동의어 캐시 기반)
+
+    용어집의 umgv_desc ↔ pos_umgv_desc를 활용하여 동의어 인식
+    """
+
+    _instance = None
+    _cache_loaded = False
+
+    def __new__(cls):
+        """싱글톤 패턴"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not FuzzyMatcher._cache_loaded:
+            self._load_cache()
+            FuzzyMatcher._cache_loaded = True
+
+    def _load_cache(self):
+        """캐시 로드"""
+        cache_data = KnowledgeCacheBuilder.load_cache('synonyms_cache.json')
+
+        if not cache_data:
+            print("[WARN] Synonym cache not found, using empty cache")
+            cache_data = {'forward': {}, 'reverse': {}}
+            KnowledgeCacheBuilder.save_cache(cache_data, 'synonyms_cache.json')
+
+        self.forward_map = cache_data.get('forward', {})
+        self.reverse_map = cache_data.get('reverse', {})
+
+    def get_standard_term(self, variant: str) -> str:
+        """변형 용어를 표준 용어로 변환"""
+        if not variant:
+            return variant
+
+        variant_norm = norm(variant).upper()
+
+        # 역방향 맵에서 찾기
+        if variant_norm in self.reverse_map:
+            return self.reverse_map[variant_norm]
+
+        # 매칭 실패 시 원본 반환
+        return variant
+
+    def get_synonyms(self, standard_term: str) -> List[str]:
+        """표준 용어의 모든 동의어 반환"""
+        standard_norm = norm(standard_term).upper()
+        return self.forward_map.get(standard_norm, [])
+
+    def is_synonym(self, term1: str, term2: str) -> bool:
+        """두 용어가 동의어 관계인지 확인"""
+        std1 = self.get_standard_term(term1)
+        std2 = self.get_standard_term(term2)
+        return std1.upper() == std2.upper()
+
+    def ratio(self, s1: str, s2: str) -> float:
+        """
+        두 문자열의 유사도 계산 (0.0 ~ 1.0)
+
+        먼저 동의어 관계 확인, 그 다음 Levenshtein distance 계산
+        """
+        if not s1 or not s2:
+            return 0.0
+
+        # 동의어 관계면 높은 점수
+        if self.is_synonym(s1, s2):
+            return 0.95
+
+        # Levenshtein distance 기반 유사도
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+    def find_best_match(self, query: str, candidates: List[str], threshold: float = 0.7) -> tuple:
+        """
+        후보 중 가장 유사한 것 찾기
+
+        Returns:
+            (best_match, similarity_score) or (None, 0.0)
+        """
+        best_match = None
+        best_score = 0.0
+
+        for candidate in candidates:
+            score = self.ratio(query, candidate)
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = candidate
+
+        return best_match, best_score
+
+
+class AbbreviationExpander:
+    """
+    약어 확장 (동적 캐시 기반)
+
+    POS 문서에서 자주 사용되는 약어를 전체 형태로 확장
+    """
+
+    _instance = None
+    _cache_loaded = False
+
+    def __new__(cls):
+        """싱글톤 패턴"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not AbbreviationExpander._cache_loaded:
+            self._load_cache()
+            AbbreviationExpander._cache_loaded = True
+
+    def _load_cache(self):
+        """캐시 로드"""
+        cache_data = KnowledgeCacheBuilder.load_cache('abbreviations_cache.json')
+
+        if not cache_data:
+            print("[WARN] Abbreviation cache not found, using basic abbreviations")
+            cache_data = KnowledgeCacheBuilder.build_abbreviation_cache(None)
+            KnowledgeCacheBuilder.save_cache(cache_data, 'abbreviations_cache.json')
+
+        self.abbrev_map = cache_data
+
+    def expand(self, text: str) -> List[str]:
+        """
+        약어를 모든 가능한 확장으로 변환
+
+        Args:
+            text: 입력 텍스트 (예: "M/E OUTPUT")
+
+        Returns:
+            확장된 형태들 (예: ["M/E OUTPUT", "Main Engine OUTPUT", "Marine Engine OUTPUT"])
+        """
+        expansions = [text]
+
+        for abbrev, full_forms in self.abbrev_map.items():
+            if abbrev in text.upper():
+                for full_form in full_forms:
+                    # 대소문자 보존하면서 치환
+                    expanded = re.sub(
+                        abbrev,
+                        full_form,
+                        text,
+                        flags=re.IGNORECASE
+                    )
+                    if expanded not in expansions:
+                        expansions.append(expanded)
+
+        return expansions
+
+    def get_full_forms(self, abbrev: str) -> List[str]:
+        """약어의 모든 전체 형태 반환"""
+        return self.abbrev_map.get(abbrev.upper(), [])
+
+
+# =============================================================================
 # Reference Hint Engine (용어집/사양값DB 참조 힌트)
 # =============================================================================
 
@@ -2646,17 +3124,20 @@ class LightweightSpecDBIndex:
 class ExtractionHint:
     """추출 힌트 데이터"""
     spec_name: str = ""
-    
+
     # 용어집 힌트
     section_num: str = ""          # 섹션 번호 (예: "2.2.1 Main particulars")
     table_text: str = ""           # 테이블/텍스트 구분
     value_format: str = ""         # 값 형식 (숫자형/문자형/혼합형)
     pos_umgv_desc: str = ""        # POS에서의 사양명 (동의어)
-    
+    mat_attr_desc: str = ""        # mat_attr_desc (장비명)
+    umgv_uom: str = ""             # umgv_uom (단위)
+    pos_umgv_uom: str = ""         # pos_umgv_uom (POS에서의 단위)
+
     # 사양값DB 힌트
     historical_values: List[str] = field(default_factory=list)  # 과거 값들
     value_patterns: List[str] = field(default_factory=list)     # 값 패턴
-    
+
     # 유사 POS 힌트
     similar_pos_hints: List[Dict] = field(default_factory=list)  # 유사 POS 정보
 
@@ -4297,18 +4778,38 @@ class ChunkCandidateGenerator:
         section_parser: HTMLSectionParser,
         chunk_parser: HTMLChunkParser,
         glossary: LightweightGlossaryIndex = None,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        use_dynamic_knowledge: bool = True
     ):
         self.section_parser = section_parser
         self.chunk_parser = chunk_parser
         self.glossary = glossary
         self.log = logger or logging.getLogger(__name__)
 
+        # Dynamic knowledge components (lazy initialization)
+        self.use_dynamic_knowledge = use_dynamic_knowledge
+        self.fuzzy_matcher = None
+        self.unit_normalizer = None
+        self.abbreviation_expander = None
+
+        if use_dynamic_knowledge:
+            self._init_dynamic_components()
+
+    def _init_dynamic_components(self):
+        """동적 지식 컴포넌트 초기화 (lazy)"""
+        try:
+            self.fuzzy_matcher = FuzzyMatcher()
+            self.unit_normalizer = UnitNormalizer()
+            self.abbreviation_expander = AbbreviationExpander()
+        except Exception as e:
+            self.log.warning(f"Failed to initialize dynamic components: {e}")
+            self.use_dynamic_knowledge = False
+
     def generate_candidates(
         self,
         spec: SpecItem,
         hint: ExtractionHint = None,
-        max_candidates: int = 10
+        max_candidates: int = 15  # 15로 증가 (더 많은 후보 생성)
     ) -> List[ChunkCandidate]:
         """
         Spec에 대한 chunk 후보들 생성
@@ -4335,13 +4836,31 @@ class ChunkCandidateGenerator:
             self._keyword_search(spec, hint, seen_texts)
         )
 
-        # 4. 동의어 확장 검색
+        # 4. 동의어 확장 검색 (기존 용어집)
         if self.glossary:
             candidates.extend(
                 self._synonym_search(spec, hint, seen_texts)
             )
 
-        # 5. 중복 제거 및 제한
+        # === 동적 지식 기반 검색 (v53 Enhanced) ===
+        if self.use_dynamic_knowledge:
+            # 5. Fuzzy 매칭 검색 (75% 이상 유사)
+            candidates.extend(
+                self._fuzzy_match_search(spec, hint, seen_texts)
+            )
+
+            # 6. 약어 확장 검색
+            candidates.extend(
+                self._abbreviation_search(spec, hint, seen_texts)
+            )
+
+            # 7. 단위 변형 검색 (umgv_uom 있는 경우)
+            if hint and hint.umgv_uom:
+                candidates.extend(
+                    self._unit_normalized_search(spec, hint, seen_texts)
+                )
+
+        # 8. 중복 제거 및 제한
         unique_candidates = self._deduplicate(candidates)
         return unique_candidates[:max_candidates]
 
@@ -4510,6 +5029,167 @@ class ChunkCandidateGenerator:
                 unique.append(cand)
 
         return unique
+
+    # === Enhanced Search Methods (v53 Dynamic Knowledge) ===
+
+    def _fuzzy_match_search(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """
+        Fuzzy matching 기반 검색 (75% 이상 유사도)
+
+        용어집의 동의어 캐시를 활용하여 유사한 용어 검색
+        """
+        if not self.fuzzy_matcher:
+            return []
+
+        candidates = []
+        spec_name = spec.spec_name
+
+        # 1. 동의어 가져오기
+        synonyms = self.fuzzy_matcher.get_synonyms(spec_name)
+
+        # 2. 각 동의어로 검색
+        for synonym in synonyms[:5]:  # 최대 5개
+            if not synonym:
+                continue
+
+            # Section 2에서 검색
+            technical_sections = self.section_parser.get_technical_sections()
+            for section in technical_sections:
+                matches = self.section_parser.search_in_section(
+                    section.section_num,
+                    [synonym],
+                    context_chars=250
+                )
+
+                for match_text, pos in matches[:2]:  # 각 동의어당 최대 2개
+                    if match_text not in seen_texts:
+                        seen_texts.add(match_text)
+
+                        # 유사도 계산
+                        similarity = self.fuzzy_matcher.ratio(spec_name, synonym)
+
+                        candidates.append(ChunkCandidate(
+                            text=match_text,
+                            source=f"fuzzy_match_{similarity:.2f}",
+                            section_num=section.section_num,
+                            has_numeric=bool(re.search(r'\d', match_text)),
+                            keywords_found=[synonym],
+                            start_pos=pos,
+                            metadata={'fuzzy_score': similarity, 'synonym': synonym}
+                        ))
+
+        return candidates
+
+    def _abbreviation_search(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """
+        약어 확장 검색
+
+        예: "M/E OUTPUT" → "Main Engine OUTPUT", "Marine Engine OUTPUT"
+        """
+        if not self.abbreviation_expander:
+            return []
+
+        candidates = []
+        spec_name = spec.spec_name
+
+        # 1. 약어 확장
+        expansions = self.abbreviation_expander.expand(spec_name)
+
+        # 2. 확장된 형태로 검색
+        for expansion in expansions:
+            if expansion == spec_name:  # 원본은 이미 검색했으므로 스킵
+                continue
+
+            # Section 2에서 검색
+            technical_sections = self.section_parser.get_technical_sections()
+            for section in technical_sections:
+                matches = self.section_parser.search_in_section(
+                    section.section_num,
+                    [expansion],
+                    context_chars=250
+                )
+
+                for match_text, pos in matches[:2]:  # 각 확장당 최대 2개
+                    if match_text not in seen_texts:
+                        seen_texts.add(match_text)
+
+                        candidates.append(ChunkCandidate(
+                            text=match_text,
+                            source="abbreviation_expansion",
+                            section_num=section.section_num,
+                            has_numeric=bool(re.search(r'\d', match_text)),
+                            keywords_found=[expansion],
+                            start_pos=pos,
+                            metadata={'expanded_from': spec_name, 'expansion': expansion}
+                        ))
+
+        return candidates
+
+    def _unit_normalized_search(
+        self,
+        spec: SpecItem,
+        hint: ExtractionHint,
+        seen_texts: Set[str]
+    ) -> List[ChunkCandidate]:
+        """
+        단위 변형 검색
+
+        예: umgv_uom="°C" → "OC", "oc", "degC" 등으로도 검색
+        """
+        if not self.unit_normalizer or not hint.umgv_uom:
+            return []
+
+        candidates = []
+
+        # 1. 단위 변형들 가져오기
+        unit_variants = self.unit_normalizer.get_variants(hint.umgv_uom)
+
+        # 2. 각 변형으로 검색
+        for variant in unit_variants[:5]:  # 최대 5개 변형
+            if not variant:
+                continue
+
+            # Section 2에서 단위가 포함된 텍스트 검색
+            technical_sections = self.section_parser.get_technical_sections()
+            for section in technical_sections:
+                # 사양명 + 단위 조합으로 검색
+                search_terms = [
+                    f"{spec.spec_name}",  # 일단 사양명만
+                ]
+
+                matches = self.section_parser.search_in_section(
+                    section.section_num,
+                    search_terms,
+                    context_chars=300
+                )
+
+                # 매칭된 텍스트에 단위 변형이 포함되어 있는지 확인
+                for match_text, pos in matches[:3]:
+                    if variant.lower() in match_text.lower():
+                        if match_text not in seen_texts:
+                            seen_texts.add(match_text)
+
+                            candidates.append(ChunkCandidate(
+                                text=match_text,
+                                source="unit_variant_match",
+                                section_num=section.section_num,
+                                has_numeric=bool(re.search(r'\d', match_text)),
+                                keywords_found=[spec.spec_name, variant],
+                                start_pos=pos,
+                                metadata={'unit_variant': variant, 'standard_unit': hint.umgv_uom}
+                            ))
+
+        return candidates
 
 
 class ChunkQualityScorer:
@@ -5773,7 +6453,8 @@ class LLMFallbackExtractor:
         llm_client: 'UnifiedLLMClient' = None,
         use_voting: bool = True,
         glossary: LightweightGlossaryIndex = None,
-        enable_enhanced_chunk_selection: bool = True
+        enable_enhanced_chunk_selection: bool = True,
+        use_dynamic_knowledge: bool = True  # v53 Enhanced: 동적 지식 사용
     ):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
@@ -5793,6 +6474,17 @@ class LLMFallbackExtractor:
         self.llm_chunk_selector = None  # LLM 기반 chunk 선택
         self.chunk_expander = None
         self._enhanced_components_initialized = False
+
+        # v53 Enhanced: 동적 지식 컴포넌트
+        self.use_dynamic_knowledge = use_dynamic_knowledge
+        self.unit_normalizer = None
+
+        if use_dynamic_knowledge:
+            try:
+                self.unit_normalizer = UnitNormalizer()
+            except Exception as e:
+                self.log.warning(f"Failed to initialize UnitNormalizer: {e}")
+                self.use_dynamic_knowledge = False
     
     def _init_enhanced_components(self, parser: HTMLChunkParser):
         """
@@ -5926,6 +6618,11 @@ class LLMFallbackExtractor:
                 # Voting 사용 시 method 표시
                 if self.llm_client and self.use_voting:
                     result.method = "llm_fallback_voting"
+
+                # v53 Enhanced: 후처리 (범위 파싱, 단위 정규화)
+                if self.use_dynamic_knowledge:
+                    result = self._post_process_result(result, spec, hint)
+
             else:
                 self.log.debug("LLM 응답 파싱 실패: spec=%s, response=%s...",
                              spec.spec_name, response[:100] if response else "")
@@ -6483,6 +7180,108 @@ class LLMFallbackExtractor:
         except Exception as e:
             self.log.error("LLM 응답 파싱 오류: %s", e)
             return None
+
+    # === v53 Enhanced: Post-processing Methods ===
+
+    def _post_process_result(
+        self,
+        result: ExtractionResult,
+        spec: SpecItem,
+        hint: ExtractionHint = None
+    ) -> ExtractionResult:
+        """
+        추출 결과 후처리
+
+        1. 범위 표기 파싱 (예: "-15~60" → "-15" or "60")
+        2. 단위 정규화 (예: "OC" → "°C")
+        """
+        if not result or not result.value:
+            return result
+
+        # 1. 범위 표기 파싱
+        result = self._parse_range_notation(result, spec)
+
+        # 2. 단위 정규화
+        result = self._normalize_unit_in_result(result, hint)
+
+        return result
+
+    def _parse_range_notation(
+        self,
+        result: ExtractionResult,
+        spec: SpecItem
+    ) -> ExtractionResult:
+        """
+        범위 표기 파싱
+
+        예:
+        - spec_name = "minimum operating temperature", value = "-15~60" → value = "-15"
+        - spec_name = "maximum operating temperature", value = "-15~60" → value = "60"
+        """
+        value = result.value
+        spec_name_lower = spec.spec_name.lower()
+
+        # 범위 패턴 감지
+        range_patterns = [
+            r'([-\d.]+)\s*~\s*([-\d.]+)',      # -15~60
+            r'([-\d.]+)\s+to\s+([-\d.]+)',     # -15 to 60
+            r'([-\d.]+)\s*-\s*([-\d.]+)',      # -15 - 60 (단, 음수와 구분)
+            r'([-\d.]+)\s*/\s*([-\d.]+)',      # -15 / 60
+        ]
+
+        for pattern in range_patterns:
+            match = re.match(pattern, value.strip())
+            if match:
+                lower_val = match.group(1)
+                upper_val = match.group(2)
+
+                # spec_name에 따라 선택
+                if any(kw in spec_name_lower for kw in ['minimum', 'min', 'lower', 'from']):
+                    result.value = lower_val
+                    self.log.debug(f"Range parsed: '{value}' → '{lower_val}' (minimum)")
+                elif any(kw in spec_name_lower for kw in ['maximum', 'max', 'upper', 'to']):
+                    result.value = upper_val
+                    self.log.debug(f"Range parsed: '{value}' → '{upper_val}' (maximum)")
+                else:
+                    # 기본값: 범위 그대로 유지 (어느 쪽인지 불명확)
+                    self.log.debug(f"Range detected but unclear which end to use: '{value}'")
+
+                break
+
+        return result
+
+    def _normalize_unit_in_result(
+        self,
+        result: ExtractionResult,
+        hint: ExtractionHint = None
+    ) -> ExtractionResult:
+        """
+        단위 정규화
+
+        예: OC → °C, kw → kW, RPM → rpm
+        """
+        if not result.unit or not self.unit_normalizer:
+            return result
+
+        original_unit = result.unit
+        normalized_unit = self.unit_normalizer.normalize(original_unit)
+
+        if normalized_unit != original_unit:
+            result.unit = normalized_unit
+            self.log.debug(f"Unit normalized: '{original_unit}' → '{normalized_unit}'")
+
+            # confidence 약간 증가 (정규화 성공)
+            result.confidence = min(1.0, result.confidence + 0.05)
+
+        # hint의 umgv_uom과 비교하여 검증 완화
+        if hint and hint.umgv_uom:
+            expected_unit = self.unit_normalizer.normalize(hint.umgv_uom)
+            if result.unit == expected_unit or self.unit_normalizer.is_variant_of(result.unit, expected_unit):
+                # 단위가 일치하거나 변형이면 confidence 증가
+                result.confidence = min(1.0, result.confidence + 0.1)
+                self.log.debug(f"Unit matches expected: '{result.unit}' ≈ '{expected_unit}'")
+
+        return result
 
 
 # =============================================================================
