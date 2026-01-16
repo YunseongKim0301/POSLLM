@@ -743,6 +743,9 @@ UNIT_CONVERSION_TABLE = {
     'ton': 1000.0,
 }
 
+# =============================================================================
+# 단위 카테고리 매핑 (단위 변환 없이 카테고리 일치만 확인)
+# =============================================================================
 
 def normalize_unit(unit: str) -> str:
     """
@@ -3393,6 +3396,9 @@ class ExtractionHint:
     # 유사 POS 힌트
     similar_pos_hints: List[Dict] = field(default_factory=list)  # 유사 POS 정보
 
+    # 단위 관련 힌트 (데이터 기반)
+    related_units: List[str] = field(default_factory=list)  # 사양값DB/용어집에서 수집한 관련 단위들
+
     # 메타데이터 (신뢰도 평가용)
     metadata: Dict = field(default_factory=dict)  # 힌트 출처 및 신뢰도 정보
 
@@ -3548,6 +3554,7 @@ class ReferenceHintEngine:
             'embedding_sources': [],
             'historical_count': 0
         }
+        related_units_set = set()  # 중복 제거를 위한 set
 
         # 용어집 힌트
         glossary_entries = self._glossary_index.get(spec_name.upper(), [])
@@ -3567,6 +3574,15 @@ class ReferenceHintEngine:
             hint.value_format = matched.get('value_format', '')
             hint.pos_umgv_desc = matched.get('pos_umgv_desc', '')
 
+            # 용어집에서 단위 정보 수집 (umgv_uom, pos_umgv_uom)
+            hint.umgv_uom = matched.get('umgv_uom', '')
+            hint.pos_umgv_uom = matched.get('pos_umgv_uom', '')
+
+            if hint.umgv_uom:
+                related_units_set.add(hint.umgv_uom)
+            if hint.pos_umgv_uom:
+                related_units_set.add(hint.pos_umgv_uom)
+
             hint_metadata['glossary_source'] = {
                 'hull': matched.get('hull', ''),
                 'extwg': matched.get('extwg', ''),
@@ -3575,7 +3591,8 @@ class ReferenceHintEngine:
 
             self.log.debug(
                 f"[HINT] Glossary: spec={spec_name}, hull={matched.get('hull')}, "
-                f"section={hint.section_num}, pos_desc={hint.pos_umgv_desc}"
+                f"section={hint.section_num}, pos_desc={hint.pos_umgv_desc}, "
+                f"units={hint.umgv_uom}/{hint.pos_umgv_uom}"
             )
 
         # 과거 값 (사양값DB)
@@ -3619,10 +3636,15 @@ class ReferenceHintEngine:
                             'rank': idx + 1
                         })
 
+                        # 유사 사양의 단위 정보 수집
+                        similar_uom = similar.get('umgv_uom', '')
+                        if similar_uom:
+                            related_units_set.add(similar_uom)
+
                         self.log.debug(
                             f"[HINT] Embedding: spec={spec_name}, "
                             f"similar_key={embedding_key[:50]}..., "
-                            f"similarity={similarity:.3f}"
+                            f"similarity={similarity:.3f}, uom={similar_uom}"
                         )
 
                         # 유사 사양의 값도 힌트에 추가 (최대 3개)
@@ -3632,6 +3654,9 @@ class ReferenceHintEngine:
 
             except Exception as e:
                 self.log.debug(f"[HINT] Embedding search failed: {e}")
+
+        # related_units를 list로 변환하여 저장
+        hint.related_units = sorted(list(related_units_set))
 
         # 힌트 메타데이터 저장 (신뢰도 평가용)
         hint.metadata = hint_metadata
@@ -7475,6 +7500,9 @@ class LLMFallbackExtractor:
                     hint_parts.append(f"예시: {examples}")
                 if hint.pos_umgv_desc and hint.pos_umgv_desc != spec.spec_name:
                     hint_parts.append(f"다른이름: {hint.pos_umgv_desc}")
+                if hint.related_units:
+                    units_str = ', '.join(hint.related_units[:5])  # 최대 5개
+                    hint_parts.append(f"관련단위: {units_str}")
 
                 if hint_parts:
                     hint_text = f" ({', '.join(hint_parts)})"
@@ -7499,7 +7527,13 @@ class LLMFallbackExtractor:
 
 ## 작업
 위 문서에서 각 사양의 값을 찾아 추출하세요.
-값을 찾지 못한 경우 빈 문자열("")로 표시하세요.
+
+**중요 지시사항**:
+1. **단위 변환 금지**: 값과 단위를 문서에 적힌 그대로 추출하세요
+   - 예: 문서에 "5 inch"이면 → unit: "inch" (cm로 변환하지 마세요)
+   - 예상단위와 다른 단위여도, 관련단위 목록에 있으면 정상입니다
+2. 값을 찾지 못한 경우 빈 문자열("")로 표시하세요
+3. 문서에 없는 값은 절대 만들지 마세요
 
 ## 출력 형식 (JSON Array)
 정확히 다음 형식으로만 응답하세요:
@@ -7759,17 +7793,23 @@ class LLMFallbackExtractor:
         hint_section = ""
         if hint:
             hint_parts = []
-            
+
             if hint.historical_values:
                 examples = ', '.join(hint.historical_values[:3])
                 hint_parts.append(f"- 과거 값 예시: {examples}")
-            
+
             if hint.pos_umgv_desc and hint.pos_umgv_desc != spec.spec_name:
                 hint_parts.append(f"- POS에서 사용되는 다른 이름: {hint.pos_umgv_desc}")
-            
+
             if hint.section_num:
                 hint_parts.append(f"- 참조 섹션: {hint.section_num[:50]}")
-            
+
+            # 관련 단위 정보 추가 (데이터 기반)
+            if hint.related_units:
+                units_str = ', '.join(hint.related_units)
+                hint_parts.append(f"- 관련 단위 (과거 사용 예): {units_str}")
+                hint_parts.append(f"  → 이 단위들은 유사한 사양에서 사용된 적이 있으므로 같은 종류의 단위입니다")
+
             if hint_parts:
                 hint_section = "\n## 참조 힌트\n" + "\n".join(hint_parts) + "\n"
         
@@ -7832,7 +7872,9 @@ class LLMFallbackExtractor:
 
 주의사항:
 1. **필수**: 추출한 값이 위 문서에 정확히 존재하는지 확인하세요. 문서에 없는 값은 절대 만들지 마세요!
-2. **단위 표기**: "OC", "o C", "O C" 등은 모두 섭씨 온도입니다. unit 필드에 "°C" 또는 "degrees"로 정규화하세요.
+2. **단위 변환 금지**: 값과 단위를 문서에 적힌 그대로 추출하세요. 단위를 변환하지 마세요!
+   - 예: 문서에 "5 inch"라고 적혀있으면 → value: "5", unit: "inch" (cm로 변환하지 마세요)
+   - 예상 단위와 다른 단위여도, 관련 단위(과거 사용 예)에 있으면 정상입니다
 3. 값만 추출하고 사양명은 포함하지 마세요
 4. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
 5. 괄호 안의 숫자도 확인하세요 (예: "(34)mm" → value: "34", unit: "mm", "(-163OC)" → value: "-163", unit: "°C")
@@ -7981,8 +8023,8 @@ class LLMFallbackExtractor:
         # 1. 범위 표기 파싱
         result = self._parse_range_notation(result, spec)
 
-        # 2. 단위 정규화
-        result = self._normalize_unit_in_result(result, hint)
+        # 2. 단위를 문서 그대로 유지 (변환 없음)
+        result = self._validate_unit_as_is(result, hint)
 
         return result
 
@@ -8030,36 +8072,20 @@ class LLMFallbackExtractor:
 
         return result
 
-    def _normalize_unit_in_result(
+    def _validate_unit_as_is(
         self,
         result: ExtractionResult,
         hint: ExtractionHint = None
     ) -> ExtractionResult:
         """
-        단위 정규화
+        단위를 문서 그대로 유지 (변환 없음)
 
-        예: OC → °C, kw → kW, RPM → rpm
+        - 단위 변환을 수행하지 않음 (POS 문서에 적힌 그대로 유지)
+        - LLM이 프롬프트에 제공된 단위 관련 힌트를 바탕으로 적절한 chunk를 선택했으므로
+          추출된 단위를 그대로 신뢰
         """
-        if not result.unit or not self.unit_normalizer:
-            return result
-
-        original_unit = result.unit
-        normalized_unit = self.unit_normalizer.normalize(original_unit)
-
-        if normalized_unit != original_unit:
-            result.unit = normalized_unit
-            self.log.debug(f"Unit normalized: '{original_unit}' → '{normalized_unit}'")
-
-            # confidence 약간 증가 (정규화 성공)
-            result.confidence = min(1.0, result.confidence + 0.05)
-
-        # hint의 umgv_uom과 비교하여 검증 완화
-        if hint and hint.umgv_uom:
-            expected_unit = self.unit_normalizer.normalize(hint.umgv_uom)
-            if result.unit == expected_unit or self.unit_normalizer.is_variant_of(result.unit, expected_unit):
-                # 단위가 일치하거나 변형이면 confidence 증가
-                result.confidence = min(1.0, result.confidence + 0.1)
-                self.log.debug(f"Unit matches expected: '{result.unit}' ≈ '{expected_unit}'")
+        # 단위 변환 제거 - 원문 그대로 유지
+        # hint의 related_units는 LLM 프롬프트에서 이미 활용됨
 
         return result
 
