@@ -1,0 +1,575 @@
+root@astrago:/workspace# /usr/bin/python /workspace/codes/v61_extractor.py
+[INFO] 14:47:32 - ======================================================================
+[INFO] 14:47:32 - POS Extractor v61 (PostgreSQL-Enhanced)
+[INFO] 14:47:32 - ======================================================================
+[INFO] 14:47:32 - 추출 모드: LIGHT
+[INFO] 14:47:32 - 데이터 소스: DB
+[INFO] 14:47:32 - 출력: JSON=True, CSV=False, DB=False
+[INFO] 14:47:32 - ======================================================================
+[INFO] 14:47:32 - Light 모드 초기화 시작
+[INFO] 14:47:32 - 데이터 소스: DB 모드 (PostgreSQL)
+[INFO] 14:47:32 - PostgreSQL 연결 성공: 10.131.132.116:5432/managesys
+/workspace/codes/v61_extractor.py:1748: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
+  df = pd.read_sql(query, self.conn)
+[INFO] 14:47:32 - 용어집 로드 (DB): pos_dict → 16003 rows
+[INFO] 14:47:34 - 용어집 로드 완료: 16003행
+/workspace/codes/v61_extractor.py:1769: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
+  df = pd.read_sql(query, self.conn)
+[INFO] 14:47:35 - 사양값DB 로드 (DB): umgv_fin → 185664 rows
+[INFO] 14:47:48 - 사양값DB 로드 완료: 185664행
+[INFO] 14:47:48 - 지식 로드 완료: 0.13초 (동의어: 524, 단위: 76, 약어: 12)
+[INFO] 14:47:48 - 동적 지식 로드 완료: 동의어 524개, 단위 76개, 약어 12개
+[INFO] 14:47:49 - ReferenceHintEngine 초기화 완료
+[INFO] 14:47:49 - SynonymManager: Lazy loading 모드
+[INFO] 14:47:49 - SemanticMatcher: Lazy loading 모드
+[INFO] 14:47:49 - Light 모드 초기화 완료: 17.18초
+[INFO] 14:47:50 - ValueValidator 초기화 완료
+[INFO] 14:47:50 - UnifiedLLMClient 초기화: gemma3:27b (ports: [11434, 11436])
+[INFO] 14:47:50 - LLMValidator 초기화 완료 (모든 추출 결과 LLM 검증)
+[INFO] 14:47:50 - LLM Fallback 초기화: gemma3:27b (ports: [11434, 11436], Voting 활성화)
+[INFO] 14:47:50 - LLMFallbackExtractor: 동적 지식 통합 완료
+[INFO] 14:47:50 - ============================================================
+[INFO] 14:47:50 - 소량 추출 모드 (LIGHT) 시작
+[INFO] 14:47:50 - ============================================================
+[INFO] 14:47:50 - POS 파일 발견: 1개
+[INFO] 14:47:50 -   - 2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html
+/workspace/codes/v61_extractor.py:1721: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
+  df = pd.read_sql(query, self.conn)
+[INFO] 14:47:51 - 템플릿 로드 (DB): 274402 rows
+[INFO] 14:47:51 - 파일에서 추출된 hull-POS 조합: 2개
+[INFO] 14:47:54 - hull별 템플릿 수:
+[INFO] 14:47:54 -   2597: 18 rows
+[INFO] 14:47:54 - 템플릿 필터링: 18/274402 rows (파일 1개)
+POS 파일 처리:   0%|                                                                                                                                | 0/1 [00:00<?, ?file/s][INFO] 14:47:54 - 처리 중: 2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html (hull=2597, 18 specs)
+[INFO] 14:47:55 - Rule 기반 추출 성공 → LLM 검증 시작: MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE
+[INFO] 14:47:55 - Rule 기반 추출 성공 → LLM 검증 시작: MAX. SERVICE TEMPERATURE_MOTOR ROOM
+[INFO] 14:47:55 - Rule 기반 추출 성공 → LLM 검증 시작: MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE
+[INFO] 14:47:55 - LLM Fallback with Voting: spec=COMPRESSED AIR_SECONDARY INSULATION SPACE
+[INFO] 14:48:27 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:48:27 - LLM 검증 성공: MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE (confidence: 0.95)
+[INFO] 14:48:27 - LLM 값 보정: '(-163OC)' → '-163'
+[INFO] 14:48:27 - Rule 기반 추출 성공 → LLM 검증 시작: MAX. SERVICE TEMPERATURE_MOTOR ROOM
+[INFO] 14:49:12 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:49:12 - LLM 검증 성공: MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE (confidence: 0.95)
+[INFO] 14:49:12 - LLM 값 보정: '(-163OC)' → '-163'
+[INFO] 14:49:12 - Rule 기반 추출 성공 → LLM 검증 시작: MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE
+[WARNING] 14:49:14 - Voting 합의 실패: 최대 1/2개 일치 (최소 2개 필요)
+[WARNING] 14:49:14 - LLM이 Rule 결과 거부: MAX. SERVICE TEMPERATURE_MOTOR ROOM (이유: The extracted value includes 'OC' which is not a standard unit for temperature. The specification asks for degrees. The value is also extremely low for a motor room, suggesting a potential error. I've removed the 'OC' to match the expected unit, but the value itself is likely incorrect.)
+[INFO] 14:49:14 - LLM Fallback으로 재추출 시도
+[INFO] 14:49:14 - LLM Fallback with Voting: spec=MAX. SERVICE TEMPERATURE_MOTOR ROOM
+[INFO] 14:49:27 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:49:27 - Rule 기반 추출 성공 → LLM 검증 시작: MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE
+[INFO] 14:49:49 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[WARNING] 14:49:49 - LLM이 Rule 결과 거부: MAX. SERVICE TEMPERATURE_MOTOR ROOM (이유: The extracted value includes 'OC' which is not a standard unit for temperature. The specification asks for degrees. The value is also extremely low for a motor room, suggesting a potential error. I've removed the 'OC' to match the expected unit, but the value itself is likely incorrect.)
+[INFO] 14:49:49 - LLM Fallback으로 재추출 시도
+[INFO] 14:49:49 - LLM Fallback with Voting: spec=MAX. SERVICE TEMPERATURE_MOTOR ROOM
+[INFO] 14:50:10 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:50:10 - LLM 검증 성공: MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE (confidence: 0.95)
+[INFO] 14:50:10 - LLM 값 보정: '(-163OC)' → '-163'
+[INFO] 14:50:10 - LLM Fallback with Voting: spec=COMPRESSED AIR_SECONDARY INSULATION SPACE
+[INFO] 14:50:23 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:50:45 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:50:45 - LLM 검증 성공: MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE (confidence: 0.95)
+[INFO] 14:50:45 - LLM 값 보정: '(-163OC)' → '-163'
+================================================================================
+[INFO] 14:50:58 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+[INFO] 14:51:09 - Voting 성공: 2/2개 일치 (병렬 처리: 2 workers)
+POS 파일 처리: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1/1 [03:14<00:00, 194.33s/file]
+[INFO] 14:51:09 - JSON 저장: /workspace/results/ongoing/samples/extraction_result_20260116_145109.json (1 doknr, 18 items)
+
+================================================================================
+JSON 추출 결과 (Pretty Print)
+================================================================================
+[
+  {
+    "doknr": "2597-POS-0039001",
+    "items": [
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE OUTLET_GLYCOL WATER",
+        "umgv_code": "Y0055",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE OUTLET_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0056",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE SUCTION_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0057",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+{
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "CASING MATERIAL_MOTOR ROOM",
+        "umgv_code": "Y0111",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "CASING MATERIAL_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0112",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0262",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "Y",
+        "value_format": "NUMERIC",
+        "pos_mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "pos_umgv_desc": "MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "pos_umgv_value": "-163",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "degrees",
+        "pos_chunk": "Minimum cargo temperature | (-163OC)",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+{
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0253",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "Y",
+        "value_format": "NUMERIC",
+        "pos_mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "pos_umgv_desc": "MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "pos_umgv_value": "-163",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "degrees",
+        "pos_chunk": "Minimum cargo temperature | (-163OC)",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "COMPRESSED AIR_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0122",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0253",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "Y",
+        "value_format": "NUMERIC",
+        "pos_mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "pos_umgv_desc": "MAX. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "pos_umgv_value": "-163",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "degrees",
+        "pos_chunk": "Minimum cargo temperature | (-163OC)",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+{
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE OUTLET_GLYCOL WATER",
+        "umgv_code": "Y0055",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE OUTLET_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0056",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "BILGE SUCTION_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0057",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+{
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "CASING MATERIAL_MOTOR ROOM",
+        "umgv_code": "Y0111",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "CASING MATERIAL_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0112",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MAX. SERVICE TEMPERATURE_MOTOR ROOM",
+        "umgv_code": "Y0252",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+{
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0262",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "Y",
+        "value_format": "NUMERIC",
+        "pos_mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "pos_umgv_desc": "MIN. SERVICE TEMPERATURE_SECONDARY INSULATION SPACE",
+        "pos_umgv_value": "-163",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "degrees",
+        "pos_chunk": "Minimum cargo temperature | (-163OC)",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AY139001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "MAX. SERVICE TEMPERATURE_MOTOR ROOM",
+        "umgv_code": "Y0252",
+        "umgv_uom": "degrees",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      },
+      {
+        "pmg_desc": "DIAPHRAGM PUMP",
+        "pmg_code": "351E",
+        "umg_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "umg_code": "39001",
+        "mat_attr_desc": "DRAIN PUMP FOR WATER DRAIN SYSTEM",
+        "extwg": "YS39001",
+        "matnr": "2597AYS39001",
+        "doknr": "2597-POS-0039001",
+        "umgv_desc": "COMPRESSED AIR_SECONDARY INSULATION SPACE",
+        "umgv_code": "Y0122",
+        "umgv_uom": "",
+        "file_name": "2597-POS-0039001_000_01_A4_WATER_DRAIN_SYS_FINAL.html",
+        "section_num": "",
+        "table_text": "",
+        "value_format": "",
+        "pos_mat_attr_desc": "",
+        "pos_umgv_desc": "",
+        "pos_umgv_value": "",
+        "umgv_value_edit": "",
+        "pos_umgv_uom": "",
+        "pos_chunk": "",
+        "evidence_fb": "",
+        "created_on": "2026-01-16 14:51:09",
+        "updated_on": "2026-01-16 14:51:09"
+      }
+]
+  }
+]
+[INFO] 14:51:09 - ============================================================
+[INFO] 14:51:09 - 소량 추출 완료: 198.8초 소요
+[INFO] 14:51:09 -   처리 파일: 1개
+[INFO] 14:51:09 -   추출 결과: 18건
+[INFO] 14:51:09 - ============================================================
+[INFO] 14:51:09 - ============================================================
+[INFO] 14:51:09 - 추출 통계
+[INFO] 14:51:09 - ============================================================
+[INFO] 14:51:09 -   총 항목: 18
+[INFO] 14:51:09 -   Rule 성공: 4 (22.2%)
+[INFO] 14:51:09 -   LLM Fallback: 0 (0.0%)
+[INFO] 14:51:09 -   실패: 14 (77.8%)
+[INFO] 14:51:09 - ============================================================
+[INFO] 14:51:09 - 
+저장된 파일:
+[INFO] 14:51:09 -   json: /workspace/results/ongoing/samples/extraction_result_20260116_145109.json
+[INFO] 14:51:09 - 
+실행 완료
