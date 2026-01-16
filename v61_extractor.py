@@ -4239,27 +4239,34 @@ class HTMLChunkParser:
         return has_keyword or digit_ratio < 0.3
 
     def _extract_horizontal_data_table(self, table) -> List[Dict]:
-        """수평 데이터 테이블 파싱 (row=item, column=attribute)"""
+        """
+        수평 데이터 테이블 파싱 (row=item, column=attribute)
+
+        v4 개선: 다층 헤더 지원
+        """
         rows = table.find_all('tr')
         if not rows:
             return []
 
-        # 헤더 감지
-        header_rows = []
+        # 헤더 감지 (다층 헤더 지원)
+        header_row_objects = []  # BeautifulSoup row objects
+        header_texts = []  # 텍스트 리스트
         data_start_idx = 0
 
         for i, row in enumerate(rows[:5]):
             cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
             if self._detect_header_row_v3(cells):
-                header_rows.append(cells)
+                header_row_objects.append(row)
+                header_texts.append(cells)
                 data_start_idx = i + 1
             else:
                 break
 
-        if not header_rows:
+        if not header_row_objects:
             return []
 
-        headers = header_rows[-1] if header_rows else []
+        # 다층 헤더 병합
+        merged_headers = self._merge_multi_layer_headers(header_row_objects, header_texts)
 
         # 데이터 행 파싱
         kv_pairs = []
@@ -4281,12 +4288,13 @@ class HTMLChunkParser:
             for col_idx, cell in enumerate(cells[1:], start=1):
                 value_raw = cell.get_text(strip=True)
 
-                if not value_raw or len(value_raw) > 100:
+                if not value_raw or len(value_raw) > 200:
                     continue
 
                 value = re.sub(r'\s+', ' ', value_raw)
 
-                col_name = headers[col_idx] if col_idx < len(headers) else f"Column{col_idx}"
+                # 병합된 헤더 사용
+                col_name = merged_headers[col_idx] if col_idx < len(merged_headers) else f"Column{col_idx}"
 
                 if col_name and col_name.strip():
                     combined_key = f"{row_label}_{col_name}"
@@ -4300,6 +4308,74 @@ class HTMLChunkParser:
                 })
 
         return kv_pairs
+
+    def _merge_multi_layer_headers(self, header_rows: List, header_texts: List[List[str]]) -> List[str]:
+        """
+        다층 헤더 병합 (colspan, rowspan 지원)
+
+        Args:
+            header_rows: BeautifulSoup row objects
+            header_texts: 각 행의 텍스트 리스트
+
+        Returns:
+            병합된 헤더 리스트
+        """
+        if not header_rows:
+            return []
+
+        if len(header_rows) == 1:
+            # 단일 헤더
+            return header_texts[0]
+
+        # 다층 헤더 처리 (rowspan, colspan 고려)
+        first_row = header_rows[0]
+        first_cells = first_row.find_all(['td', 'th'])
+
+        # 각 셀의 colspan, rowspan 분석
+        col_info = []  # [(text, colspan, rowspan), ...]
+        for cell in first_cells:
+            text = cell.get_text(strip=True)
+            colspan = int(cell.get('colspan', 1))
+            rowspan = int(cell.get('rowspan', 1))
+            col_info.append((text, colspan, rowspan))
+
+        # 두 번째 헤더 행이 있으면 병합
+        if len(header_rows) >= 2:
+            second_row = header_rows[1]
+            second_cells = second_row.find_all(['td', 'th'])
+            second_texts = [c.get_text(strip=True) for c in second_cells]
+
+            # 병합된 헤더 생성
+            merged = []
+            second_idx = 0
+
+            for parent_text, colspan, rowspan in col_info:
+                if rowspan >= 2:
+                    # rowspan=2 이상이면, 이 셀은 두 행에 걸쳐있음
+                    # 하위 헤더 없이 그대로 사용
+                    merged.append(parent_text)
+                elif colspan == 1:
+                    # colspan=1이고 rowspan=1이면 하위 헤더 1개
+                    # 하지만 실제로는 두 번째 행에 대응하는 셀이 없을 수도 있음
+                    # 안전하게 parent만 사용
+                    merged.append(parent_text)
+                else:
+                    # colspan > 1이면, 이 parent 아래에 colspan개의 하위 헤더가 있음
+                    for _ in range(colspan):
+                        if second_idx < len(second_texts):
+                            child_text = second_texts[second_idx]
+                            if child_text:
+                                # 상위_하위 형식으로 병합
+                                merged.append(f"{parent_text}_{child_text}")
+                            else:
+                                merged.append(parent_text)
+                            second_idx += 1
+                        else:
+                            merged.append(parent_text)
+
+            return merged
+
+        return header_texts[0]
 
     def _extract_vertical_kv_table(self, table) -> List[Dict]:
         """수직 키-값 테이블 파싱 (row: key | value)"""
