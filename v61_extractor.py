@@ -4171,57 +4171,172 @@ class HTMLChunkParser:
     
     def _extract_kv_pairs(self):
         """
-        테이블에서 키-값 쌍 추출
-        
+        테이블에서 키-값 쌍 추출 (v3: 고급 파싱 통합)
+
         개선사항:
-        1. 헤더 행 감지 및 제외
-        2. 값 유효성 검사 강화
-        3. 중복 키-값 방지
-        4. 테이블 구조 자동 인식
-        5. CamelCase 키 분리 (예: "Maincomponent" → "Main component")
+        1. 수평 데이터 테이블 지원 (row=item, column=attribute)
+        2. 수직 키-값 테이블 지원 (traditional key|value)
+        3. 멀티 레이어 헤더 감지
+        4. 중복 제거 강화
         """
-        seen_pairs = set()  # 중복 방지용
-        
-        for table in self.tables:
-            # 테이블 구조 분석: 첫 행이 헤더인지 확인
-            is_header_row_table = self._is_header_row_table(table)
-            
-            for row_idx, row in enumerate(table):
-                # 헤더 행 스킵 (첫 행이 헤더인 경우)
-                if is_header_row_table and row_idx == 0:
+        all_pairs = []
+
+        # BeautifulSoup로 직접 파싱 (더 정확한 테이블 구조 파악)
+        if not self.soup:
+            return
+
+        for table in self.soup.find_all('table'):
+            # 수평 데이터 테이블 시도
+            horizontal_pairs = self._extract_horizontal_data_table(table)
+            all_pairs.extend(horizontal_pairs)
+
+            # 수직 키-값 테이블 시도
+            vertical_pairs = self._extract_vertical_kv_table(table)
+            all_pairs.extend(vertical_pairs)
+
+        # 중복 제거
+        seen = set()
+        self.kv_pairs = []
+        for pair in all_pairs:
+            norm_key = self._aggressive_normalize(pair['key'])
+            norm_value = self._aggressive_normalize(pair['value'])
+            pair_signature = (norm_key, norm_value)
+
+            if pair_signature not in seen:
+                seen.add(pair_signature)
+                self.kv_pairs.append(pair)
+
+    def _aggressive_normalize(self, text: str) -> str:
+        """강화된 정규화 (v61_standalone_test.py 이식)"""
+        if not text:
+            return ""
+        text = re.sub(r'\s+', '', text)
+        text = text.replace('*', '').replace('□', '').replace('■', '')
+        text = text.replace('(', '').replace(')', '').replace('[', '').replace(']', '')
+        # 숫자 내 쉼표 제거 (1,000 → 1000)
+        text = text.replace(',', '')
+        return text.upper()
+
+    def _detect_header_row_v3(self, row_cells: List[str]) -> bool:
+        """헤더 행 감지 (v3)"""
+        if not row_cells:
+            return False
+
+        non_empty = [c for c in row_cells if c.strip()]
+        if len(non_empty) < len(row_cells) * 0.3:
+            return False
+
+        header_keywords = ['COMPOSITION', 'RANGE', 'DESIGN', 'ITEM', 'SPECIFICATION',
+                           'PARAMETER', 'VALUE', 'UNIT', 'TYPE', 'MODEL']
+
+        text = ' '.join(row_cells).upper()
+        has_keyword = any(kw in text for kw in header_keywords)
+
+        digit_count = sum(1 for c in text if c.isdigit())
+        total_chars = len([c for c in text if c.isalnum()])
+        digit_ratio = digit_count / total_chars if total_chars > 0 else 0
+
+        return has_keyword or digit_ratio < 0.3
+
+    def _extract_horizontal_data_table(self, table) -> List[Dict]:
+        """수평 데이터 테이블 파싱 (row=item, column=attribute)"""
+        rows = table.find_all('tr')
+        if not rows:
+            return []
+
+        # 헤더 감지
+        header_rows = []
+        data_start_idx = 0
+
+        for i, row in enumerate(rows[:5]):
+            cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+            if self._detect_header_row_v3(cells):
+                header_rows.append(cells)
+                data_start_idx = i + 1
+            else:
+                break
+
+        if not header_rows:
+            return []
+
+        headers = header_rows[-1] if header_rows else []
+
+        # 데이터 행 파싱
+        kv_pairs = []
+
+        for row_idx in range(data_start_idx, len(rows)):
+            row = rows[row_idx]
+            cells = row.find_all(['td', 'th'])
+
+            if not cells:
+                continue
+
+            row_label_raw = cells[0].get_text(strip=True)
+
+            if not row_label_raw or len(row_label_raw) > 100:
+                continue
+
+            row_label = re.sub(r'\s+', ' ', row_label_raw)
+
+            for col_idx, cell in enumerate(cells[1:], start=1):
+                value_raw = cell.get_text(strip=True)
+
+                if not value_raw or len(value_raw) > 100:
                     continue
-                
-                # 2셀 이상 구조 처리
-                if len(row) >= 2:
-                    # 첫 번째 셀이 키, 두 번째가 값인 기본 구조
-                    key = self._normalize_cell_key(row[0].strip())
-                    value = row[1].strip()
-                    
-                    if self._is_valid_kv_pair(key, value, seen_pairs):
-                        pair_key = f"{key}|{value}"
-                        if pair_key not in seen_pairs:
-                            seen_pairs.add(pair_key)
-                            self.kv_pairs.append({
-                                'key': key,
-                                'value': value,
-                                'row': row
-                            })
-                
-                # 멀티 컬럼 구조 분석 (3셀 이상인 경우)
-                if len(row) >= 3:
-                    for i in range(len(row) - 1):
-                        key = self._normalize_cell_key(row[i].strip())
-                        value = row[i + 1].strip()
-                        
-                        if self._is_valid_kv_pair(key, value, seen_pairs):
-                            pair_key = f"{key}|{value}"
-                            if pair_key not in seen_pairs:
-                                seen_pairs.add(pair_key)
-                                self.kv_pairs.append({
-                                    'key': key,
-                                    'value': value,
-                                    'row': row
-                                })
+
+                value = re.sub(r'\s+', ' ', value_raw)
+
+                col_name = headers[col_idx] if col_idx < len(headers) else f"Column{col_idx}"
+
+                if col_name and col_name.strip():
+                    combined_key = f"{row_label}_{col_name}"
+                else:
+                    combined_key = row_label
+
+                kv_pairs.append({
+                    'key': combined_key,
+                    'value': value,
+                    'row': [row_label, value]
+                })
+
+        return kv_pairs
+
+    def _extract_vertical_kv_table(self, table) -> List[Dict]:
+        """수직 키-값 테이블 파싱 (row: key | value)"""
+        rows = table.find_all('tr')
+        kv_pairs = []
+
+        for row in rows:
+            cells = row.find_all(['td', 'th'])
+
+            if len(cells) < 2:
+                continue
+
+            for i in range(len(cells) - 1):
+                key_raw = cells[i].get_text(strip=True)
+                value_raw = cells[i + 1].get_text(strip=True)
+
+                if not key_raw or len(key_raw) < 3 or len(key_raw) > 150:
+                    continue
+
+                key = re.sub(r'\s+', ' ', key_raw)
+                value = re.sub(r'\s+', ' ', value_raw)
+
+                noise_patterns = [
+                    r'^GENERAL\b', r'^TABLE\b', r'^SECTION\b', r'^PAGE\b',
+                    r'^ITEM\s*NO', r'^NO\.\s*$', r'^DESCRIPTION\s*$'
+                ]
+                if any(re.search(pat, key.upper()) for pat in noise_patterns):
+                    continue
+
+                if value and len(value) < 200:
+                    kv_pairs.append({
+                        'key': key,
+                        'value': value,
+                        'row': [key, value]
+                    })
+
+        return kv_pairs
     
     def _normalize_cell_key(self, key: str) -> str:
         """
