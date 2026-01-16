@@ -6247,41 +6247,43 @@ class LLMChunkSelector:
 
         candidates_text = "\n".join(candidate_list)
 
-        # 힌트 정보
+        # Hint information
         hint_text = ""
         if hint:
             hint_parts = []
             if hint.historical_values:
-                hint_parts.append(f"과거값 예시: {', '.join(hint.historical_values[:2])}")
+                hint_parts.append(f"Historical values: {', '.join(hint.historical_values[:2])}")
             if hint.pos_umgv_desc:
-                hint_parts.append(f"다른이름: {hint.pos_umgv_desc}")
+                hint_parts.append(f"Alternative name: {hint.pos_umgv_desc}")
             if hint.section_num:
-                hint_parts.append(f"예상 섹션: {hint.section_num}")
+                hint_parts.append(f"Expected section: {hint.section_num}")
 
             if hint_parts:
-                hint_text = "\n힌트: " + ", ".join(hint_parts)
+                hint_text = "\nHints: " + ", ".join(hint_parts)
 
-        prompt = f"""당신은 POS 문서에서 사양값을 추출하는 전문가입니다.
-아래의 후보 chunk 중에서 "{spec.spec_name}" 사양값을 추출하기에 가장 적합한 chunk를 선택하세요.
+        prompt = f"""You are a technical specialist in the shipbuilding industry, expert in selecting the most relevant text chunk for specification extraction from POS documents.
 
-**추출 대상:**
-- 사양명: {spec.spec_name}
-- 장비: {spec.equipment or '미지정'}
-- 예상단위: {spec.expected_unit or '미지정'}{hint_text}
+**Context**: Select the chunk that most clearly contains the specification value for "{spec.spec_name}".
 
-**후보 Chunks:**
+**Target Specification:**
+- Spec Name: {spec.spec_name}
+- Equipment: {spec.equipment or 'N/A'}
+- Expected Unit: {spec.expected_unit or 'N/A'}{hint_text}
+
+**Candidate Chunks:**
 {candidates_text}
 
-**작업:**
-위 후보 중 "{spec.spec_name}" 값을 추출하기에 가장 적합한 chunk의 번호를 선택하세요.
-주의: Section 2 (TECHNICAL PARTICULARS)의 chunk가 일반적으로 가장 정확합니다.
+**Task:**
+Select the index of the chunk that is MOST suitable for extracting the value of "{spec.spec_name}".
 
-**출력 형식:**
-정확히 다음 형식으로만 응답하세요:
-SELECTED: [번호]
+**Note**: Chunks from Section 2 (TECHNICAL PARTICULARS) are typically most accurate for machinery specifications.
+
+**Output Format:**
+Respond EXACTLY in the following format:
+SELECTED: [index_number]
 CONFIDENCE: [0.0-1.0]
 
-예:
+Example:
 SELECTED: 2
 CONFIDENCE: 0.9"""
 
@@ -7156,37 +7158,40 @@ class LLMValidator:
     def _build_validation_prompt(self, spec: SpecItem, extracted_value: str,
                                  extracted_unit: str, html_context: str) -> str:
         """검증 프롬프트 생성"""
-        prompt = f"""You are a technical specification validator.
+        prompt = f"""You are a quality assurance specialist in the shipbuilding industry, expert in validating extracted specifications from POS (Purchase Order Specification) documents for marine equipment.
 
-**Task**: Validate if the extracted value is correct for the given specification.
+**Context**: Verify that the extracted value is correct and matches the specification in the original document. Ensure data accuracy is critical for ship manufacturing.
 
-**Specification Name**: {spec.spec_name}
-**Equipment**: {spec.equipment if spec.equipment else 'N/A'}
-**Expected Unit**: {spec.expected_unit if spec.expected_unit else 'N/A'}
+**Specification**:
+- Name: {spec.spec_name}
+- Equipment: {spec.equipment if spec.equipment else 'N/A'}
+- Expected Unit: {spec.expected_unit if spec.expected_unit else 'N/A'}
 
-**Extracted Value**: {extracted_value}
-**Extracted Unit**: {extracted_unit}
+**Extracted Result to Validate**:
+- Value: {extracted_value}
+- Unit: {extracted_unit}
 
-**HTML Context**:
+**Original Document Context**:
 ```
 {html_context[:2000]}
 ```
 
-**Instructions**:
-1. Check if the extracted value matches the specification name in the context
-2. Check if the unit is appropriate
-3. Check if the value format is correct (number, text, etc.)
+**Validation Checklist**:
+1. Does the extracted value EXACTLY exist in the document context?
+2. Does it correspond to the specification name "{spec.spec_name}"?
+3. Is the unit appropriate and matching the document notation?
+4. Is the value format correct (numeric, text, range, etc.)?
 
-**Output Format** (JSON):
+**Output Format** (JSON only):
 {{
   "is_valid": true/false,
   "confidence": 0.0-1.0,
-  "llm_extracted_value": "corrected value if different",
-  "llm_extracted_unit": "corrected unit if different",
-  "reason": "brief explanation"
+  "llm_extracted_value": "corrected value if different, or same value",
+  "llm_extracted_unit": "corrected unit if different, or same unit",
+  "reason": "brief explanation of validation result"
 }}
 
-**Output**:"""
+Respond with JSON only:"""
 
         return prompt
 
@@ -7487,7 +7492,7 @@ class LLMFallbackExtractor:
 
         15개 사양을 하나의 프롬프트로 구성
         """
-        # 사양 목록 구성
+        # Build specification list
         spec_list = []
         for idx, spec in enumerate(specs, 1):
             hint = hints.get(spec.spec_name)
@@ -7497,55 +7502,61 @@ class LLMFallbackExtractor:
                 hint_parts = []
                 if hint.historical_values:
                     examples = ', '.join(hint.historical_values[:2])
-                    hint_parts.append(f"예시: {examples}")
+                    hint_parts.append(f"examples: {examples}")
                 if hint.pos_umgv_desc and hint.pos_umgv_desc != spec.spec_name:
-                    hint_parts.append(f"다른이름: {hint.pos_umgv_desc}")
+                    hint_parts.append(f"alt_name: {hint.pos_umgv_desc}")
                 if hint.related_units:
-                    units_str = ', '.join(hint.related_units[:5])  # 최대 5개
-                    hint_parts.append(f"관련단위: {units_str}")
+                    units_str = ', '.join(hint.related_units[:5])  # max 5 units
+                    hint_parts.append(f"related_units: {units_str}")
 
                 if hint_parts:
                     hint_text = f" ({', '.join(hint_parts)})"
 
             spec_list.append(
-                f"{idx}. 사양명: {spec.spec_name}, "
-                f"장비: {spec.equipment or '미지정'}, "
-                f"예상단위: {spec.expected_unit or '미지정'}{hint_text}"
+                f"{idx}. Spec: {spec.spec_name}, "
+                f"Equipment: {spec.equipment or 'N/A'}, "
+                f"Expected Unit: {spec.expected_unit or 'N/A'}{hint_text}"
             )
 
         spec_section = "\n".join(spec_list)
 
-        prompt = f"""당신은 POS 문서에서 여러 사양값을 한 번에 추출하는 전문가입니다.
+        prompt = f"""You are a technical specialist in the shipbuilding industry, expert in batch extraction of multiple specifications from POS (Purchase Order Specification) documents for marine equipment.
 
-## 추출 대상 ({len(specs)}개)
+**Context**: POS documents are technical specifications for ship machinery. Extract multiple specification values efficiently while preserving EXACT notation from the original document.
+
+## Target Specifications ({len(specs)} specs)
 {spec_section}
 
-## 문서 내용
+## Document Content
 ```
 {chunk}
 ```
 
-## 작업
-위 문서에서 각 사양의 값을 찾아 추출하세요.
+## Task
+Extract values for ALL specifications listed above from the document.
 
-**중요 지시사항**:
-1. **단위 변환 금지**: 값과 단위를 문서에 적힌 그대로 추출하세요
-   - 예: 문서에 "5 inch"이면 → unit: "inch" (cm로 변환하지 마세요)
-   - 예상단위와 다른 단위여도, 관련단위 목록에 있으면 정상입니다
-2. 값을 찾지 못한 경우 빈 문자열("")로 표시하세요
-3. 문서에 없는 값은 절대 만들지 마세요
+## Critical Instructions
+1. **NO UNIT CONVERSION**: Extract values and units EXACTLY as written in the document
+   - Example: If document says "5 inch" → unit: "inch" (do NOT convert to cm)
+   - If unit differs from expected but appears in related_units, it's normal
 
-## 출력 형식 (JSON Array)
-정확히 다음 형식으로만 응답하세요:
+2. If value not found, use empty string ("")
+
+3. NEVER fabricate values not present in the document
+
+4. Use historical examples (if provided) as format guidance
+
+## Output Format (JSON Array)
+Respond ONLY in the following JSON Array format:
 ```json
 [
-  {{"spec_index": 1, "value": "추출된값1", "unit": "단위1", "confidence": 0.9}},
-  {{"spec_index": 2, "value": "추출된값2", "unit": "단위2", "confidence": 0.8}},
+  {{"spec_index": 1, "value": "extracted_value1", "unit": "unit1", "confidence": 0.9}},
+  {{"spec_index": 2, "value": "extracted_value2", "unit": "unit2", "confidence": 0.8}},
   ...
 ]
 ```
 
-중요: 반드시 {len(specs)}개의 결과를 JSON Array로 반환하세요."""
+**MANDATORY**: Return EXACTLY {len(specs)} results in the JSON Array (one for each spec_index 1 to {len(specs)})."""
 
         return prompt
 
@@ -7789,101 +7800,116 @@ class LLMFallbackExtractor:
         - value_patterns: 값 형식
         - pos_umgv_desc: POS에서의 사양명 (동의어)
         """
-        # 힌트 정보 구성
+        # Build hint section
         hint_section = ""
         if hint:
             hint_parts = []
 
             if hint.historical_values:
                 examples = ', '.join(hint.historical_values[:3])
-                hint_parts.append(f"- 과거 값 예시: {examples}")
+                hint_parts.append(f"- Historical values: {examples}")
 
             if hint.pos_umgv_desc and hint.pos_umgv_desc != spec.spec_name:
-                hint_parts.append(f"- POS에서 사용되는 다른 이름: {hint.pos_umgv_desc}")
+                hint_parts.append(f"- Alternative name in POS: {hint.pos_umgv_desc}")
 
             if hint.section_num:
-                hint_parts.append(f"- 참조 섹션: {hint.section_num[:50]}")
+                hint_parts.append(f"- Reference section: {hint.section_num[:50]}")
 
-            # 관련 단위 정보 추가 (데이터 기반)
+            # Add related units (data-driven)
             if hint.related_units:
                 units_str = ', '.join(hint.related_units)
-                hint_parts.append(f"- 관련 단위 (과거 사용 예): {units_str}")
-                hint_parts.append(f"  → 이 단위들은 유사한 사양에서 사용된 적이 있으므로 같은 종류의 단위입니다")
+                hint_parts.append(f"- Related units (from historical data): {units_str}")
+                hint_parts.append(f"  → These units have been used in similar specifications (same type)")
 
             if hint_parts:
-                hint_section = "\n## 참조 힌트\n" + "\n".join(hint_parts) + "\n"
+                hint_section = "\n## Reference Hints\n" + "\n".join(hint_parts) + "\n"
         
         # MAX/MIN 키워드 감지
         spec_name_lower = spec.spec_name.lower()
         is_max_spec = any(kw in spec_name_lower for kw in ['max', 'maximum', 'upper', 'high'])
         is_min_spec = any(kw in spec_name_lower for kw in ['min', 'minimum', 'lower', 'low'])
 
-        # 범위 파싱 지시사항
+        # Range parsing instruction
         range_instruction = ""
         if is_max_spec:
             range_instruction = """
-**중요 - 범위 값 처리**:
-- 사양명에 "MAX", "MAXIMUM"이 포함되어 있습니다
-- 문서에 범위 표기(예: "10 - 55", "-20 to 70")가 있으면 **상한값(큰 값)**만 추출하세요
-- 예: "10 - 55 OC" → value: "55", unit: "°C"
-- 예: "-20 to 70 OC" → value: "70", unit: "°C"
+**CRITICAL - Range Value Handling**:
+- The specification name contains "MAX" or "MAXIMUM"
+- If the document shows a range (e.g., "10 - 55", "-20 to 70"), extract ONLY the **upper bound (larger value)**
+- Example: "10 - 55 OC" → value: "55", unit: "°C"
+- Example: "-20 to 70 OC" → value: "70", unit: "°C"
 """
         elif is_min_spec:
             range_instruction = """
-**중요 - 범위 값 처리**:
-- 사양명에 "MIN", "MINIMUM"이 포함되어 있습니다
-- 문서에 범위 표기(예: "10 - 55", "-20 to 70")가 있으면 **하한값(작은 값)**만 추출하세요
-- 예: "10 - 55 OC" → value: "10", unit: "°C"
-- 예: "-20 to 70 OC" → value: "-20", unit: "°C"
+**CRITICAL - Range Value Handling**:
+- The specification name contains "MIN" or "MINIMUM"
+- If the document shows a range (e.g., "10 - 55", "-20 to 70"), extract ONLY the **lower bound (smaller value)**
+- Example: "10 - 55 OC" → value: "10", unit: "°C"
+- Example: "-20 to 70 OC" → value: "-20", unit: "°C"
 """
 
-        prompt = f"""당신은 POS(Purchase Order Specification) 문서에서 사양값을 추출하는 전문가입니다.
+        prompt = f"""You are a technical specialist in the shipbuilding industry, expert in extracting specifications from POS (Purchase Order Specification) documents for marine equipment.
 
-## 추출 대상
-- 사양명: {spec.spec_name}
-- 장비: {spec.equipment or '(미지정)'}
-- 예상 단위: {spec.expected_unit or '(미지정)'}
+**Context**: POS documents are technical specifications for ship machinery (pumps, boilers, engines, etc.). Your task is to accurately extract specification values while preserving the EXACT notation from the original document.
+
+## Target Specification
+- Spec Name: {spec.spec_name}
+- Equipment: {spec.equipment or '(Not specified)'}
+- Expected Unit: {spec.expected_unit or '(Not specified)'}
 {hint_section}
-## 문서 내용
+## Document Content
 ```
 {chunk}
 ```
 
-## 작업
-위 문서에서 "{spec.spec_name}" 사양의 값을 찾아 추출하세요.
+## Task
+Extract the value for specification "{spec.spec_name}" from the above document.
 {range_instruction}
-## 출력 형식 (JSON)
-정확히 다음 형식으로만 응답하세요:
+## Output Format (JSON)
+Respond ONLY in the following JSON format:
 ```json
 {{
-  "value": "추출된값",
-  "unit": "단위",
+  "value": "extracted_value",
+  "unit": "unit",
   "confidence": 0.0~1.0,
-  "original_spec_name": "POS에 적힌 사양명 그대로",
-  "original_unit": "POS에 적힌 단위 그대로",
-  "original_equipment": "POS에 적힌 장비명 그대로"
+  "original_spec_name": "exact spec name from POS",
+  "original_unit": "exact unit from POS",
+  "original_equipment": "exact equipment name from POS"
 }}
 ```
 
-값을 찾지 못한 경우:
+If value not found:
 ```json
 {{"value": "", "unit": "", "confidence": 0.0, "original_spec_name": "", "original_unit": "", "original_equipment": ""}}
 ```
 
-주의사항:
-1. **필수**: 추출한 값이 위 문서에 정확히 존재하는지 확인하세요. 문서에 없는 값은 절대 만들지 마세요!
-2. **단위 변환 금지**: 값과 단위를 문서에 적힌 그대로 추출하세요. 단위를 변환하지 마세요!
-   - 예: 문서에 "5 inch"라고 적혀있으면 → value: "5", unit: "inch" (cm로 변환하지 마세요)
-   - 예상 단위와 다른 단위여도, 관련 단위(과거 사용 예)에 있으면 정상입니다
-3. 값만 추출하고 사양명은 포함하지 마세요
-4. 숫자와 단위를 분리하세요 (예: "70 m3/h" → value: "70", unit: "m3/h")
-5. 괄호 안의 숫자도 확인하세요 (예: "(34)mm" → value: "34", unit: "mm", "(-163OC)" → value: "-163", unit: "°C")
-6. 여러 값이 있으면 "{spec.spec_name}"에 가장 관련성 높은 것을 선택하세요
-7. 확실하지 않거나 문서에 값이 명확히 없으면 빈 문자열 반환하세요
-8. 참조 힌트의 과거 값 예시를 참고하여 비슷한 형식으로 추출하세요
-9. **중요**: original_spec_name, original_unit, original_equipment는 POS 문서에 적힌 그대로를 추출하세요
-   - 대소문자, 띄어쓰기, 특수문자 등을 정확히 보존하세요
-   - 예: POS에 "capacity"로 적혀있으면 "capacity", "CAPACITY"로 적혀있으면 "CAPACITY"
+## Critical Instructions
+1. **MANDATORY**: Verify the extracted value EXACTLY exists in the document. NEVER fabricate values!
+
+2. **NO UNIT CONVERSION**: Extract values and units EXACTLY as written in the document!
+   - Example: If document says "5 inch" → value: "5", unit: "inch" (do NOT convert to cm)
+   - If the unit differs from expected unit but appears in "Related units", it's normal
+
+3. Extract ONLY the value, not the specification name
+
+4. Separate numbers and units (e.g., "70 m3/h" → value: "70", unit: "m3/h")
+
+5. Check values in parentheses (e.g., "(34)mm" → value: "34", unit: "mm")
+
+6. If multiple values exist, select the one most relevant to "{spec.spec_name}"
+
+7. Return empty strings if uncertain or value not clearly present
+
+8. Reference historical values from hints for format guidance
+
+9. **PRESERVE ORIGINAL NOTATION**: For original_spec_name, original_unit, original_equipment:
+   - Keep exact case, spacing, special characters
+   - Example: "capacity" stays "capacity", "CAPACITY" stays "CAPACITY"
+
+## Example
+Document: "Capacity: 700 m³/h, Type: VC"
+Spec: "CAPACITY"
+Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_name": "Capacity", "original_unit": "m³/h", "original_equipment": ""}}
 """
         return prompt
     
