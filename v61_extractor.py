@@ -90,6 +90,12 @@ try:
 except ImportError:
     HAS_SENTENCE_TRANSFORMER = False
 
+try:
+    from FlagEmbedding import BGEM3FlagModel
+    HAS_BGE_M3 = True
+except ImportError:
+    HAS_BGE_M3 = False
+
 
 # #############################################################################
 # ██████╗ ██╗   ██╗███╗   ██╗    ███╗   ███╗ ██████╗ ██████╗ ███████╗
@@ -3591,10 +3597,13 @@ class ReferenceHintEngine:
                 # embedding_key 생성: hull_pmg_desc_umg_desc_mat_attr_desc
                 query_text = f"{hull} {spec_name}"
 
+                # BGE-M3 모델 가져오기 (있으면 사용, 없으면 None)
+                embedding_model = getattr(self.pg_loader, 'embedding_model', None)
+
                 similar_specs = self.pg_loader.search_by_key_with_fallback(
                     search_key=f"{hull}_{spec_name}",  # 간단한 키
                     query_text=query_text,
-                    embedding_model=None,  # TODO: BGE-M3 모델 주입
+                    embedding_model=embedding_model,
                     top_k=3,
                     similarity_threshold=0.7
                 )
@@ -4171,57 +4180,248 @@ class HTMLChunkParser:
     
     def _extract_kv_pairs(self):
         """
-        테이블에서 키-값 쌍 추출
-        
+        테이블에서 키-값 쌍 추출 (v3: 고급 파싱 통합)
+
         개선사항:
-        1. 헤더 행 감지 및 제외
-        2. 값 유효성 검사 강화
-        3. 중복 키-값 방지
-        4. 테이블 구조 자동 인식
-        5. CamelCase 키 분리 (예: "Maincomponent" → "Main component")
+        1. 수평 데이터 테이블 지원 (row=item, column=attribute)
+        2. 수직 키-값 테이블 지원 (traditional key|value)
+        3. 멀티 레이어 헤더 감지
+        4. 중복 제거 강화
         """
-        seen_pairs = set()  # 중복 방지용
-        
-        for table in self.tables:
-            # 테이블 구조 분석: 첫 행이 헤더인지 확인
-            is_header_row_table = self._is_header_row_table(table)
-            
-            for row_idx, row in enumerate(table):
-                # 헤더 행 스킵 (첫 행이 헤더인 경우)
-                if is_header_row_table and row_idx == 0:
+        all_pairs = []
+
+        # BeautifulSoup로 직접 파싱 (더 정확한 테이블 구조 파악)
+        if not self.soup:
+            return
+
+        for table in self.soup.find_all('table'):
+            # 수평 데이터 테이블 시도
+            horizontal_pairs = self._extract_horizontal_data_table(table)
+            all_pairs.extend(horizontal_pairs)
+
+            # 수직 키-값 테이블 시도
+            vertical_pairs = self._extract_vertical_kv_table(table)
+            all_pairs.extend(vertical_pairs)
+
+        # 중복 제거
+        seen = set()
+        self.kv_pairs = []
+        for pair in all_pairs:
+            norm_key = self._aggressive_normalize(pair['key'])
+            norm_value = self._aggressive_normalize(pair['value'])
+            pair_signature = (norm_key, norm_value)
+
+            if pair_signature not in seen:
+                seen.add(pair_signature)
+                self.kv_pairs.append(pair)
+
+    def _aggressive_normalize(self, text: str) -> str:
+        """강화된 정규화 (v61_standalone_test.py 이식)"""
+        if not text:
+            return ""
+        text = re.sub(r'\s+', '', text)
+        text = text.replace('*', '').replace('□', '').replace('■', '')
+        text = text.replace('(', '').replace(')', '').replace('[', '').replace(']', '')
+        # 숫자 내 쉼표 제거 (1,000 → 1000)
+        text = text.replace(',', '')
+        return text.upper()
+
+    def _detect_header_row_v3(self, row_cells: List[str]) -> bool:
+        """헤더 행 감지 (v3)"""
+        if not row_cells:
+            return False
+
+        non_empty = [c for c in row_cells if c.strip()]
+        if len(non_empty) < len(row_cells) * 0.3:
+            return False
+
+        header_keywords = ['COMPOSITION', 'RANGE', 'DESIGN', 'ITEM', 'SPECIFICATION',
+                           'PARAMETER', 'VALUE', 'UNIT', 'TYPE', 'MODEL']
+
+        text = ' '.join(row_cells).upper()
+        has_keyword = any(kw in text for kw in header_keywords)
+
+        digit_count = sum(1 for c in text if c.isdigit())
+        total_chars = len([c for c in text if c.isalnum()])
+        digit_ratio = digit_count / total_chars if total_chars > 0 else 0
+
+        return has_keyword or digit_ratio < 0.3
+
+    def _extract_horizontal_data_table(self, table) -> List[Dict]:
+        """
+        수평 데이터 테이블 파싱 (row=item, column=attribute)
+
+        v4 개선: 다층 헤더 지원
+        """
+        rows = table.find_all('tr')
+        if not rows:
+            return []
+
+        # 헤더 감지 (다층 헤더 지원)
+        header_row_objects = []  # BeautifulSoup row objects
+        header_texts = []  # 텍스트 리스트
+        data_start_idx = 0
+
+        for i, row in enumerate(rows[:5]):
+            cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+            if self._detect_header_row_v3(cells):
+                header_row_objects.append(row)
+                header_texts.append(cells)
+                data_start_idx = i + 1
+            else:
+                break
+
+        if not header_row_objects:
+            return []
+
+        # 다층 헤더 병합
+        merged_headers = self._merge_multi_layer_headers(header_row_objects, header_texts)
+
+        # 데이터 행 파싱
+        kv_pairs = []
+
+        for row_idx in range(data_start_idx, len(rows)):
+            row = rows[row_idx]
+            cells = row.find_all(['td', 'th'])
+
+            if not cells:
+                continue
+
+            row_label_raw = cells[0].get_text(strip=True)
+
+            if not row_label_raw or len(row_label_raw) > 100:
+                continue
+
+            row_label = re.sub(r'\s+', ' ', row_label_raw)
+
+            for col_idx, cell in enumerate(cells[1:], start=1):
+                value_raw = cell.get_text(strip=True)
+
+                if not value_raw or len(value_raw) > 200:
                     continue
-                
-                # 2셀 이상 구조 처리
-                if len(row) >= 2:
-                    # 첫 번째 셀이 키, 두 번째가 값인 기본 구조
-                    key = self._normalize_cell_key(row[0].strip())
-                    value = row[1].strip()
-                    
-                    if self._is_valid_kv_pair(key, value, seen_pairs):
-                        pair_key = f"{key}|{value}"
-                        if pair_key not in seen_pairs:
-                            seen_pairs.add(pair_key)
-                            self.kv_pairs.append({
-                                'key': key,
-                                'value': value,
-                                'row': row
-                            })
-                
-                # 멀티 컬럼 구조 분석 (3셀 이상인 경우)
-                if len(row) >= 3:
-                    for i in range(len(row) - 1):
-                        key = self._normalize_cell_key(row[i].strip())
-                        value = row[i + 1].strip()
-                        
-                        if self._is_valid_kv_pair(key, value, seen_pairs):
-                            pair_key = f"{key}|{value}"
-                            if pair_key not in seen_pairs:
-                                seen_pairs.add(pair_key)
-                                self.kv_pairs.append({
-                                    'key': key,
-                                    'value': value,
-                                    'row': row
-                                })
+
+                value = re.sub(r'\s+', ' ', value_raw)
+
+                # 병합된 헤더 사용
+                col_name = merged_headers[col_idx] if col_idx < len(merged_headers) else f"Column{col_idx}"
+
+                if col_name and col_name.strip():
+                    combined_key = f"{row_label}_{col_name}"
+                else:
+                    combined_key = row_label
+
+                kv_pairs.append({
+                    'key': combined_key,
+                    'value': value,
+                    'row': [row_label, value]
+                })
+
+        return kv_pairs
+
+    def _merge_multi_layer_headers(self, header_rows: List, header_texts: List[List[str]]) -> List[str]:
+        """
+        다층 헤더 병합 (colspan, rowspan 지원)
+
+        Args:
+            header_rows: BeautifulSoup row objects
+            header_texts: 각 행의 텍스트 리스트
+
+        Returns:
+            병합된 헤더 리스트
+        """
+        if not header_rows:
+            return []
+
+        if len(header_rows) == 1:
+            # 단일 헤더
+            return header_texts[0]
+
+        # 다층 헤더 처리 (rowspan, colspan 고려)
+        first_row = header_rows[0]
+        first_cells = first_row.find_all(['td', 'th'])
+
+        # 각 셀의 colspan, rowspan 분석
+        col_info = []  # [(text, colspan, rowspan), ...]
+        for cell in first_cells:
+            text = cell.get_text(strip=True)
+            colspan = int(cell.get('colspan', 1))
+            rowspan = int(cell.get('rowspan', 1))
+            col_info.append((text, colspan, rowspan))
+
+        # 두 번째 헤더 행이 있으면 병합
+        if len(header_rows) >= 2:
+            second_row = header_rows[1]
+            second_cells = second_row.find_all(['td', 'th'])
+            second_texts = [c.get_text(strip=True) for c in second_cells]
+
+            # 병합된 헤더 생성
+            merged = []
+            second_idx = 0
+
+            for parent_text, colspan, rowspan in col_info:
+                if rowspan >= 2:
+                    # rowspan=2 이상이면, 이 셀은 두 행에 걸쳐있음
+                    # 하위 헤더 없이 그대로 사용
+                    merged.append(parent_text)
+                elif colspan == 1:
+                    # colspan=1이고 rowspan=1이면 하위 헤더 1개
+                    # 하지만 실제로는 두 번째 행에 대응하는 셀이 없을 수도 있음
+                    # 안전하게 parent만 사용
+                    merged.append(parent_text)
+                else:
+                    # colspan > 1이면, 이 parent 아래에 colspan개의 하위 헤더가 있음
+                    for _ in range(colspan):
+                        if second_idx < len(second_texts):
+                            child_text = second_texts[second_idx]
+                            if child_text:
+                                # 상위_하위 형식으로 병합
+                                merged.append(f"{parent_text}_{child_text}")
+                            else:
+                                merged.append(parent_text)
+                            second_idx += 1
+                        else:
+                            merged.append(parent_text)
+
+            return merged
+
+        return header_texts[0]
+
+    def _extract_vertical_kv_table(self, table) -> List[Dict]:
+        """수직 키-값 테이블 파싱 (row: key | value)"""
+        rows = table.find_all('tr')
+        kv_pairs = []
+
+        for row in rows:
+            cells = row.find_all(['td', 'th'])
+
+            if len(cells) < 2:
+                continue
+
+            for i in range(len(cells) - 1):
+                key_raw = cells[i].get_text(strip=True)
+                value_raw = cells[i + 1].get_text(strip=True)
+
+                if not key_raw or len(key_raw) < 3 or len(key_raw) > 150:
+                    continue
+
+                key = re.sub(r'\s+', ' ', key_raw)
+                value = re.sub(r'\s+', ' ', value_raw)
+
+                noise_patterns = [
+                    r'^GENERAL\b', r'^TABLE\b', r'^SECTION\b', r'^PAGE\b',
+                    r'^ITEM\s*NO', r'^NO\.\s*$', r'^DESCRIPTION\s*$'
+                ]
+                if any(re.search(pat, key.upper()) for pat in noise_patterns):
+                    continue
+
+                if value and len(value) < 200:
+                    kv_pairs.append({
+                        'key': key,
+                        'value': value,
+                        'row': [key, value]
+                    })
+
+        return kv_pairs
     
     def _normalize_cell_key(self, key: str) -> str:
         """
@@ -7954,6 +8154,26 @@ class POSExtractorV61:
                 self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
                 self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
                 self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
+
+        # BGE-M3 Embedding Model 초기화
+        self.bge_m3_model = None
+        if HAS_BGE_M3:
+            try:
+                self.log.info("BGE-M3 모델 로딩 시작...")
+                self.bge_m3_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+                self.log.info("BGE-M3 모델 로딩 완료")
+
+                # PostgresKnowledgeLoader에 모델 주입
+                if self.pg_knowledge_loader:
+                    self.pg_knowledge_loader.embedding_model = self.bge_m3_model
+                    self.log.info("PostgresKnowledgeLoader에 BGE-M3 모델 주입 완료")
+            except Exception as e:
+                self.log.warning(f"BGE-M3 모델 로딩 실패: {e}")
+                self.log.warning("임베딩 검색 없이 계속 진행합니다")
+                self.bge_m3_model = None
+        else:
+            self.log.warning("FlagEmbedding 패키지가 설치되지 않음. 임베딩 검색 비활성화")
+            self.log.warning("설치 방법: pip install FlagEmbedding")
 
         # 통계
         self.stats = {
