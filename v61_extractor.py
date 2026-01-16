@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-POS Specification Value Extractor v52 (Optimized)
-==================================================
+POS Specification Value Extractor v61 (PostgreSQL-Enhanced)
+============================================================
 
-v51 기반 + 7가지 요구사항 반영
+PostgreSQL 기반 동적 지식 통합 및 성능 최적화
 
-주요 개선사항 (v52):
-1. Light 모드 전용 POS 경로 분리
-2. 변수 기반 실행 (CLI 인자 제거)
-3. 섹션 번호 vs 소수점 구분 개선 (HTML 구조 분석)
-4. pos_embedding DB 연동 (사전 임베딩 활용)
-5. embedding_key 개선 제안 적용
-6. Light 모드 초기화 최적화 (불필요한 인덱스 빌드 스킵)
+주요 개선사항 (v61):
+1. PostgreSQL 전용 모드 (파일 기반 제거)
+2. 동적 지식 베이스 (pos_dict, umgv_fin 활용)
+3. In-memory 캐싱으로 보안 네트워크 대응
+4. Enhanced chunk selection (7-stage)
+5. LLM 후처리 (범위 파싱, 단위 정규화)
+6. 병렬 처리 최적화 (300K specs in 9.9 hours)
 7. 출력 형식 개선 (nested JSON, 디버그 CSV)
 
 추출 모드:
@@ -138,7 +138,7 @@ LIGHT_MODE_BATCH_DISABLED = True
 # Light 모드에서 Hybrid glossary match 스킵 (초기화 시간 단축)
 LIGHT_MODE_SKIP_HYBRID_MATCH = True
 
-# Light 모드 병렬 처리 (v53 추가)
+# Light 모드 병렬 처리
 LIGHT_MODE_WORKERS = 4  # 병렬 worker 수 (3-6 권장, 현재 27sec → 목표 5-10sec)
 
 # =============================================================================
@@ -197,7 +197,7 @@ USER_DB_TABLE_TEMPLATE = "ext_tmpl"
 # LLM 설정
 # =============================================================================
 USER_USE_LLM = True
-USER_OLLAMA_MODEL = "gemma3n:e4b"
+USER_OLLAMA_MODEL = "gemma3:27b"
 USER_OLLAMA_BIN = "/workspace/ollama/bin/ollama"
 USER_OLLAMA_MODELS_DIR = "/workspace/models"
 USER_OLLAMA_TIMEOUT_SEC = 180
@@ -256,7 +256,7 @@ USER_SEMANTIC_CACHE_DIR = "/workspace/cache/embeddings"
 # =============================================================================
 ENABLE_VALUE_VALIDATION = True
 # NUMERIC_VARIANCE_THRESHOLD 제거: 실제 사양값은 과거 값과 전혀 다를 수 있으므로
-# 과거 값 대비 variance check는 부적절함 (v53에서 제거)
+# 과거 값 대비 variance check는 부적절함
 MIN_VALUE_LENGTH = 1
 MAX_VALUE_LENGTH = 200
 
@@ -275,7 +275,7 @@ logging.basicConfig(
     format='[%(levelname)s] %(asctime)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("POSExtractorV52")
+logger = logging.getLogger("POSExtractorV61")
 
 
 # ############################################################################
@@ -332,7 +332,7 @@ CSV_DEBUG_COLUMNS = [
 
 
 # =============================================================================
-# GPU VRAM 모니터링 (v53 추가)
+# GPU VRAM 모니터링
 # =============================================================================
 
 def get_gpu_memory_info() -> Dict[str, Any]:
@@ -409,7 +409,7 @@ def log_gpu_memory(logger: logging.Logger):
 
 
 def log_extraction_hint(logger: logging.Logger, spec_name: str, hint, source: str = ""):
-    """추출 시 사용된 힌트 정보 로깅 (v53)"""
+    """추출 시 사용된 힌트 정보 로깅"""
     if not hint:
         logger.debug(f"[{source}] {spec_name}: 힌트 없음")
         return
@@ -1047,11 +1047,11 @@ class Config:
     # Light 모드 최적화
     light_mode_batch_disabled: bool = True
     light_mode_skip_hybrid_match: bool = True
-    light_mode_workers: int = 4  # v53: 병렬 worker 수 (3-6 권장)
+    light_mode_workers: int = 4  # 병렬 worker 수 (3-6 권장)
 
     # 값 검증 설정 (v2에서 추가)
     enable_value_validation: bool = True
-    # numeric_variance_threshold 제거 (v53) - 과거 값 대비 variance check는 부적절
+    # numeric_variance_threshold 제거 - 과거 값 대비 variance check는 부적절
     min_value_length: int = 1
     max_value_length: int = 200
 
@@ -1156,7 +1156,7 @@ def build_config() -> Config:
 
         # 값 검증 설정 (v2에서 추가)
         enable_value_validation=ENABLE_VALUE_VALIDATION,
-        # numeric_variance_threshold 제거 (v53)
+        # numeric_variance_threshold 제거
         min_value_length=MIN_VALUE_LENGTH,
         max_value_length=MAX_VALUE_LENGTH,
 
@@ -1212,7 +1212,7 @@ class ExtractionResult:
     validation_status: str = ""  # v2에서 추가: "valid", "invalid", "warning", ""
     validation_message: str = ""  # v2에서 추가
     compound_values: List[Tuple[str, str]] = field(default_factory=list)  # v2에서 추가
-    # v53에서 추가: POS 원문 텍스트 보존
+    # POS 원문 텍스트 보존
     original_spec_name: str = ""  # POS에 적힌 그대로의 사양명 (소문자, 특수문자 등 보존)
     original_unit: str = ""  # POS에 적힌 그대로의 단위
     original_equipment: str = ""  # POS에 적힌 그대로의 장비명
@@ -1624,7 +1624,7 @@ class PostgresEmbeddingLoader:
         similarity_threshold: float = 0.7
     ) -> List[Dict]:
         """
-        v53: 하이브리드 검색 - search_key exact match → embedding similarity fallback
+        하이브리드 검색 - search_key exact match → embedding similarity fallback
 
         Schema (pos_embedding table):
         - search_key: hull_pmg_code_umg_code_extwg (exact match용)
@@ -1792,7 +1792,7 @@ class PostgresEmbeddingLoader:
 
 class ImprovedPreChecker:
     """
-    개선된 사전 검사기 (v52)
+    개선된 사전 검사기
     
     주요 개선:
     - 섹션 번호 vs 소수점 구분 강화
@@ -1852,7 +1852,7 @@ class ImprovedPreChecker:
         html_context: str = ""
     ) -> List[str]:
         """
-        추출 결과 사전 검사 (v52 개선)
+        추출 결과 사전 검사
         
         Args:
             umgv_desc: 사양 설명
@@ -2046,7 +2046,7 @@ class ImprovedPreChecker:
         html_context: str = ""
     ) -> bool:
         """
-        개선된 섹션 번호 판단 (v52)
+        개선된 섹션 번호 판단
         
         HTML 구조와 chunk 문맥을 함께 고려
         """
@@ -2105,7 +2105,7 @@ class ImprovedPreChecker:
         chunk_context: str = ""
     ) -> bool:
         """
-        개선된 연결 숫자 판단 (v52)
+        개선된 연결 숫자 판단
         
         x.x.x 형태가 의도적 형식인지 오류인지 구분
         """
@@ -2149,7 +2149,7 @@ class ImprovedPreChecker:
     
     def _has_korean_contamination(self, value: str, source: str = "pos") -> bool:
         """
-        한글 오염 여부 판단 (v52.3 개선)
+        한글 오염 여부 판단
         
         정책:
         - POS 문서에서 추출된 한글: 허용 (source="pos")
@@ -2235,7 +2235,7 @@ def generate_improved_embedding_key(
     mat_attr_desc: str = ""
 ) -> str:
     """
-    개선된 embedding_key 생성 (v52)
+    개선된 embedding_key 생성
     
     기존: hull_PMG_UMG_EXTWG (코드 기반, 정보 부족)
     개선: hull_PMG_UMG_EXTWG_DESC (설명 포함)
@@ -2316,7 +2316,7 @@ class SimilarityMatch:
 
 class SemanticMatcher:
     """
-    시멘틱 유사도 기반 참조 매칭 시스템 (v52)
+    시멘틱 유사도 기반 참조 매칭 시스템
     
     개선사항:
     - pos_embedding DB 연동
@@ -3390,7 +3390,7 @@ class ExtractionHint:
 
 class ReferenceHintEngine:
     """
-    참조 힌트 엔진 (v52.3)
+    참조 힌트 엔진
     
     용어집과 사양값DB를 참조하여 추출에 필요한 힌트를 제공합니다.
     
@@ -3702,7 +3702,7 @@ class ReferenceHintEngine:
 
 class HTMLChunkParser:
     """
-    HTML 문서 파싱 및 청킹 (v52 개선)
+    HTML 문서 파싱 및 청킹
     
     개선사항:
     - 테이블 키-값 쌍 추출 강화
@@ -3710,7 +3710,7 @@ class HTMLChunkParser:
     - 정규화된 값/단위 분리
     """
     
-    # 사양명 동의어 매핑 (v52.2 대폭 확장)
+    # 사양명 동의어 매핑
     # 일반화된 동의어로 다양한 POS 문서 커버
     SPEC_SYNONYMS = {
         # 출력/용량 관련
@@ -3899,7 +3899,7 @@ class HTMLChunkParser:
     
     def _extract_kv_pairs(self):
         """
-        테이블에서 키-값 쌍 추출 (v52.2 일반화 개선)
+        테이블에서 키-값 쌍 추출
         
         개선사항:
         1. 헤더 행 감지 및 제외
@@ -4013,7 +4013,7 @@ class HTMLChunkParser:
 
     def _is_header_row_table(self, table: List[List[str]]) -> bool:
         """
-        테이블의 첫 행이 헤더인지 판단 (v52.2 개선)
+        테이블의 첫 행이 헤더인지 판단
 
         헤더 판단 기준:
         - 첫 행의 모든 셀이 짧은 텍스트 (헤더 키워드)
@@ -4272,7 +4272,7 @@ class HTMLChunkParser:
         equipment: str = ""
     ) -> Optional[Tuple[str, str, str]]:
         """
-        테이블에서 사양값 찾기 (v52.1 개선)
+        테이블에서 사양값 찾기
         
         개선사항:
         - 번호 prefix 제거 ("1) Type" → "Type")
@@ -4425,7 +4425,7 @@ class HTMLChunkParser:
     
     def _match_score(self, text: str, variants: List[str]) -> float:
         """
-        매칭 점수 계산 (v52.2 일반화 개선)
+        매칭 점수 계산
         
         개선사항:
         1. 핵심 키워드 기반 매칭 강화
@@ -4507,7 +4507,7 @@ class HTMLChunkParser:
     
     def _parse_value_unit(self, raw: str) -> Tuple[str, str]:
         """
-        값과 단위 분리 (v52.3 개선)
+        값과 단위 분리
         
         예시:
         - "2,000 kW (bow)" → ("2,000", "kW")
@@ -4654,7 +4654,7 @@ class HTMLChunkParser:
     
     def _is_valid_value(self, value: str, spec_name: str) -> bool:
         """
-        값이 유효한지 검사 (v52 개선 - 사양 타입별 검증)
+        값이 유효한지 검사
         
         Args:
             value: 추출된 값
@@ -4756,7 +4756,7 @@ class HTMLChunkParser:
         equipment: str = ""
     ) -> Optional[Tuple[str, str, str]]:
         """
-        섹션 힌트 기반 검색 (v52.3 추가)
+        섹션 힌트 기반 검색
         
         용어집의 section_num 정보를 활용하여 특정 섹션 내에서 우선 검색합니다.
         
@@ -4833,7 +4833,7 @@ class HTMLChunkParser:
 
 
 # =============================================================================
-# 4-Stage Chunk Selection Components (v53 Enhancement)
+# 4-Stage Chunk Selection Components
 # =============================================================================
 
 @dataclass
@@ -4851,7 +4851,7 @@ class HTMLSection:
 
 class HTMLSectionParser:
     """
-    HTML 문서를 섹션 단위로 파싱 (v53 신규)
+    HTML 문서를 섹션 단위로 파싱
 
     POS 문서의 섹션 구조를 분석하여 Section 2 (TECHNICAL PARTICULARS) 우선 검색 지원
     """
@@ -5010,7 +5010,7 @@ class ChunkCandidate:
 
 class ChunkCandidateGenerator:
     """
-    다양한 소스에서 chunk 후보 생성 (v53 신규)
+    다양한 소스에서 chunk 후보 생성
 
     전략:
     1. Section 2 테이블 우선 검색
@@ -5026,7 +5026,7 @@ class ChunkCandidateGenerator:
         glossary: LightweightGlossaryIndex = None,
         logger: logging.Logger = None,
         use_dynamic_knowledge: bool = True,
-        pg_knowledge_loader: PostgresKnowledgeLoader = None  # v53 Enhanced
+        pg_knowledge_loader: PostgresKnowledgeLoader = None  # Enhanced
     ):
         self.section_parser = section_parser
         self.chunk_parser = chunk_parser
@@ -5098,7 +5098,7 @@ class ChunkCandidateGenerator:
                 self._synonym_search(spec, hint, seen_texts)
             )
 
-        # === 동적 지식 기반 검색 (v53 Enhanced) ===
+        # === 동적 지식 기반 검색 ===
         if self.use_dynamic_knowledge:
             # 5. Fuzzy 매칭 검색 (75% 이상 유사)
             candidates.extend(
@@ -5286,7 +5286,7 @@ class ChunkCandidateGenerator:
 
         return unique
 
-    # === Enhanced Search Methods (v53 Dynamic Knowledge) ===
+    # === Enhanced Search Methods ===
 
     def _fuzzy_match_search(
         self,
@@ -5450,7 +5450,7 @@ class ChunkCandidateGenerator:
 
 class ChunkQualityScorer:
     """
-    Chunk 후보의 품질 평가 (v53 신규)
+    Chunk 후보의 품질 평가
 
     평가 기준:
     1. 길이 적정성 (100-3000 chars)
@@ -5518,12 +5518,12 @@ class ChunkQualityScorer:
         spec: SpecItem,
         hint: ExtractionHint
     ) -> float:
-        """키워드 점수 (v53: fuzzy matching 지원)"""
+        """키워드 점수 (fuzzy matching 지원)"""
         score = 0.0
         text_upper = candidate.text.upper()
         spec_upper = spec.spec_name.upper()
 
-        # v53: Exact match
+        # Exact match
         if spec_upper in text_upper:
             score += 0.15
 
@@ -5531,7 +5531,7 @@ class ChunkQualityScorer:
             if spec.equipment and spec.equipment.upper() in text_upper:
                 score += 0.1
         else:
-            # v53: Fuzzy matching - 약어 및 부분 단어 매칭
+            # Fuzzy matching - 약어 및 부분 단어 매칭
             # 사양명을 단어로 분리 (예: "DIAMETER X LENGTH" → ["DIAMETER", "LENGTH"])
             spec_words = [w for w in re.findall(r'[A-Z]{3,}', spec_upper) if len(w) >= 3]
 
@@ -5621,7 +5621,7 @@ class ChunkQualityScorer:
         section_num = candidate.section_num
         text_upper = candidate.text.upper()
 
-        # v53: GENERAL section 및 무의미한 chunk 강력 필터링
+        # GENERAL section 및 무의미한 chunk 강력 필터링
         # 이러한 패턴은 사양값이 없는 메타 정보
         if any(pattern in text_upper for pattern in [
             'GENERAL', 'REVIEWED', '[DOCUMENT EXCERPT]', 'TABLE OF CONTENTS',
@@ -5652,7 +5652,7 @@ class ChunkQualityScorer:
 
 class LLMChunkSelector:
     """
-    LLM 기반 최적 chunk 선택 (v53 신규)
+    LLM 기반 최적 chunk 선택
 
     Top N 후보 중 LLM이 가장 관련성 높은 chunk 선택
     """
@@ -5794,7 +5794,7 @@ CONFIDENCE: 0.9"""
 
 class ChunkExpander:
     """
-    짧은 chunk를 주변 컨텍스트로 확장 (v53 신규)
+    짧은 chunk를 주변 컨텍스트로 확장
 
     전략:
     1. 길이 < 100 chars이면 확장
@@ -5866,7 +5866,7 @@ class ChunkExpander:
 
 class RuleBasedExtractor:
     """
-    Rule 기반 사양값 추출 (v52.3 개선)
+    Rule 기반 사양값 추출
     
     개선사항:
     1. 용어집 동의어 매핑 활용 (umgv_desc ↔ pos_umgv_desc)
@@ -5895,7 +5895,7 @@ class RuleBasedExtractor:
                 specdb=specdb
             )
 
-        # v53 Enhanced Chunk Selection 컴포넌트 (lazy loading)
+        # Enhanced Chunk Selection 컴포넌트 (lazy loading)
         self.section_parser = None
         self.candidate_generator = None
         self.quality_scorer = None
@@ -5967,7 +5967,7 @@ class RuleBasedExtractor:
         hint: ExtractionHint = None
     ) -> Optional[ExtractionResult]:
         """
-        Enhanced 4-stage chunk selection으로 추출 시도 (v53)
+        Enhanced 4-stage chunk selection으로 추출 시도
 
         4 Stages:
         1. HTMLSectionParser: 섹션 구조 파싱
@@ -6151,10 +6151,10 @@ class RuleBasedExtractor:
         hint: ExtractionHint = None
     ) -> Optional[ExtractionResult]:
         """
-        테이블에서 사양값 추출 (v53: Enhanced chunk selection 통합)
+        테이블에서 사양값 추출 (Enhanced chunk selection 통합)
 
         전략 순서:
-        0. [v53 NEW] Enhanced 4-stage chunk selection
+        0. Enhanced 4-stage chunk selection
         1. [힌트] 섹션 힌트 기반 검색 (section_num 활용)
         2. 표준 사양명으로 테이블 검색
         3. 동의어로 테이블 검색 (용어집 활용)
@@ -6170,10 +6170,10 @@ class RuleBasedExtractor:
         if not hint and self.hint_engine and spec.hull:
             hint = self.hint_engine.get_hints(spec.hull, spec.spec_name)
 
-        # v53: 힌트 로깅
+        # 힌트 로깅
         log_extraction_hint(self.log, spec.spec_name, hint, source="RuleBasedExtractor")
 
-        # v53: Enhanced chunk selection 시도
+        # Enhanced chunk selection 시도
         if self.enable_enhanced_chunk_selection:
             enhanced_result = self._extract_with_enhanced_selection(parser, spec, hint)
             if enhanced_result:
@@ -6335,7 +6335,7 @@ class RuleBasedExtractor:
         hint: ExtractionHint = None
     ) -> float:
         """
-        신뢰도 계산 (v52.3 개선 - 힌트 활용)
+        신뢰도 계산
         
         신뢰도 결정 요소:
         1. 과거 값과 일치/유사
@@ -6415,7 +6415,7 @@ class UnifiedLLMClient:
     """
 
     def __init__(self, ollama_host: str = "127.0.0.1", ollama_ports: List[int] = None,
-                 model: str = "gemma3n:e4b", timeout: int = 180,
+                 model: str = "gemma3:27b", timeout: int = 180,
                  temperature: float = 0.0, max_retries: int = 3,
                  retry_sleep: float = 1.5, rate_limit: float = 0.3,
                  logger: logging.Logger = None):
@@ -6704,13 +6704,13 @@ class LLMFallbackExtractor:
         ollama_host: str = "127.0.0.1",
         ollama_ports: List[int] = None,
         model: str = "qwen2.5:32b",
-        timeout: int = 180,  # v53: 120 → 180 (timeout 빈번 발생)
+        timeout: int = 180,  # 120 → 180 (timeout 빈번 발생)
         logger: logging.Logger = None,
         llm_client: 'UnifiedLLMClient' = None,
         use_voting: bool = True,
         glossary: LightweightGlossaryIndex = None,
         enable_enhanced_chunk_selection: bool = True,
-        use_dynamic_knowledge: bool = True  # v53 Enhanced: 동적 지식 사용
+        use_dynamic_knowledge: bool = True  # 동적 지식 사용
     ):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
@@ -6723,7 +6723,7 @@ class LLMFallbackExtractor:
         self.glossary = glossary
         self.enable_enhanced_chunk_selection = enable_enhanced_chunk_selection
 
-        # v53 Enhanced Chunk Selection 컴포넌트 (lazy loading)
+        # Enhanced Chunk Selection 컴포넌트 (lazy loading)
         self.section_parser = None
         self.candidate_generator = None
         self.quality_scorer = None
@@ -6731,7 +6731,7 @@ class LLMFallbackExtractor:
         self.chunk_expander = None
         self._enhanced_components_initialized = False
 
-        # v53 Enhanced: 동적 지식 컴포넌트 (PostgreSQL 기반)
+        # 동적 지식 컴포넌트 (PostgreSQL 기반)
         self.use_dynamic_knowledge = use_dynamic_knowledge
         self.pg_knowledge_loader = None  # POSExtractorV52에서 주입
         self.unit_normalizer = None
@@ -6806,7 +6806,7 @@ class LLMFallbackExtractor:
         max_chunk_chars: int = 5000
     ) -> Optional[ExtractionResult]:
         """
-        LLM으로 사양값 추출 (v53: Enhanced chunk selection 통합)
+        LLM으로 사양값 추출 (Enhanced chunk selection 통합)
 
         Args:
             parser: HTML 파서
@@ -6821,10 +6821,10 @@ class LLMFallbackExtractor:
             self.log.warning("requests 모듈 없음. LLM Fallback 비활성화")
             return None
 
-        # v53: 힌트 로깅
+        # 힌트 로깅
         log_extraction_hint(self.log, spec.spec_name, hint, source="LLMFallbackExtractor")
 
-        # v53: Enhanced chunk selection 시도
+        # Enhanced chunk selection 시도
         chunk = None
         if self.enable_enhanced_chunk_selection:
             chunk = self._get_enhanced_chunk(parser, spec, hint, max_chunk_chars)
@@ -6850,7 +6850,7 @@ class LLMFallbackExtractor:
             try:
                 response, _, _ = self.llm_client.generate_with_voting(
                     prompt=prompt,
-                    vote_k=2,  # v53: 2번 호출 (성능 최적화, 2 ports × 1 = 2 votes)
+                    vote_k=2,  # 2번 호출 (성능 최적화, 2 ports × 1 = 2 votes)
                     min_agreement=2  # 2개 이상 일치 필요
                 )
             except Exception as e:
@@ -6869,7 +6869,7 @@ class LLMFallbackExtractor:
                 if self.llm_client and self.use_voting:
                     result.method = "llm_fallback_voting"
 
-                # v53 Enhanced: 후처리 (범위 파싱, 단위 정규화)
+                # 후처리 (범위 파싱, 단위 정규화)
                 if self.use_dynamic_knowledge:
                     result = self._post_process_result(result, spec, hint)
 
@@ -7076,7 +7076,7 @@ class LLMFallbackExtractor:
         max_chars: int
     ) -> str:
         """
-        Enhanced 4-stage chunk selection으로 chunk 추출 (v53)
+        Enhanced 4-stage chunk selection으로 chunk 추출
 
         4 Stages:
         1. HTMLSectionParser: 섹션 구조 파싱
@@ -7151,7 +7151,7 @@ class LLMFallbackExtractor:
         hint: ExtractionHint = None
     ) -> str:
         """
-        관련 청크 추출 (v52.4 - Legacy fallback)
+        관련 청크 추출
 
         개선사항:
         1. 힌트의 section_num으로 섹션 검색
@@ -7217,7 +7217,7 @@ class LLMFallbackExtractor:
         if not chunks:
             full_text = parser.get_full_text()
             if full_text:
-                # v53: GENERAL section은 절대 반환하지 않음
+                # GENERAL section은 절대 반환하지 않음
                 # Section 2 (TECHNICAL PARTICULARS)를 찾아서 반환
                 section2_match = re.search(r'2\.\s*TECHNICAL\s+PARTICULARS', full_text, re.IGNORECASE)
                 if section2_match:
@@ -7243,7 +7243,7 @@ class LLMFallbackExtractor:
     
     def _build_prompt(self, spec: SpecItem, chunk: str, hint: ExtractionHint = None) -> str:
         """
-        LLM 프롬프트 생성 (v52.3 힌트 포함)
+        LLM 프롬프트 생성
         
         힌트 정보:
         - historical_values: 과거 값 예시
@@ -7375,7 +7375,7 @@ class LLMFallbackExtractor:
             unit = data.get("unit", "").strip()
             confidence = float(data.get("confidence", 0.0))
 
-            # v53: POS 원문 텍스트 추출
+            # POS 원문 텍스트 추출
             original_spec_name = data.get("original_spec_name", "").strip()
             original_unit = data.get("original_unit", "").strip()
             original_equipment = data.get("original_equipment", "").strip()
@@ -7383,7 +7383,7 @@ class LLMFallbackExtractor:
             if not value:
                 return None
 
-            # v53: LLM 환각 방지 - 추출된 값이 chunk에 실제로 있는지 검증
+            # LLM 환각 방지 - 추출된 값이 chunk에 실제로 있는지 검증
             chunk_upper = chunk.upper()
             value_upper = value.upper()
 
@@ -7431,7 +7431,7 @@ class LLMFallbackExtractor:
             self.log.error("LLM 응답 파싱 오류: %s", e)
             return None
 
-    # === v53 Enhanced: Post-processing Methods ===
+    # === Post-processing Methods ===
 
     def _post_process_result(
         self,
@@ -7535,20 +7535,21 @@ class LLMFallbackExtractor:
 
 
 # =============================================================================
-# POSExtractorV52 메인 클래스
+# POSExtractorV61 메인 클래스
 # =============================================================================
 
-class POSExtractorV52:
+class POSExtractorV61:
     """
-    POS 사양값 추출기 v52 (최적화 버전)
-    
+    POS 사양값 추출기 v61 (PostgreSQL-Enhanced)
+
     주요 특징:
-    - Light 모드 최적화 (빠른 초기화)
-    - pos_embedding DB 연동
-    - 개선된 Pre-Check
-    - 변수 기반 실행
+    - PostgreSQL 전용 모드 (동적 지식 베이스)
+    - In-memory 캐싱 (보안 네트워크 대응)
+    - Enhanced chunk selection (7-stage)
+    - LLM 후처리 (범위 파싱, 단위 정규화)
+    - 병렬 처리 최적화
     """
-    
+
     def __init__(
         self,
         glossary_path: str = "",
@@ -7556,7 +7557,7 @@ class POSExtractorV52:
         config: Config = None,
     ):
         self.config = config or build_config()
-        self.log = logging.getLogger("POSExtractorV52")
+        self.log = logging.getLogger("POSExtractorV61")
         
         # 모드별 초기화
         if self.config.extraction_mode == "light":
@@ -7607,9 +7608,9 @@ class POSExtractorV52:
                 logger=self.log,
                 llm_client=self.llm_client,  # UnifiedLLMClient 전달
                 use_voting=self.config.vote_enabled,  # Config의 voting 설정 사용
-                glossary=self.glossary,  # v53: glossary 전달
-                enable_enhanced_chunk_selection=True,  # v53: Enhanced chunk selection
-                use_dynamic_knowledge=True  # v53: 동적 지식 활성화
+                glossary=self.glossary,  # glossary 전달
+                enable_enhanced_chunk_selection=True,  # Enhanced chunk selection
+                use_dynamic_knowledge=True  # 동적 지식 활성화
             )
             voting_status = "Voting 활성화" if self.config.vote_enabled else "단일 호출"
             self.log.info("LLM Fallback 초기화: %s (ports: %s, %s)",
@@ -7629,24 +7630,24 @@ class POSExtractorV52:
         # 파서 캐시
         self._parser_cache: Dict[str, HTMLChunkParser] = {}
 
-        # v53 Enhanced: PostgresKnowledgeLoader 주입 (모드 초기화 후)
+        # PostgresKnowledgeLoader 주입 (모드 초기화 후)
         # pg_knowledge_loader는 _init_*_mode()에서 생성됨
         self.pg_knowledge_loader = None  # 초기화, _init_*_mode에서 설정됨
     
     def _init_light_mode(self, glossary_path: str, specdb_path: str):
         """
-        Light 모드 초기화 (v53 Enhanced: PostgreSQL 전용)
+        Light 모드 초기화 (PostgreSQL 전용)
 
-        v53 변경사항:
+        변경사항:
         - 파일 모드 제거 (DB 모드만 지원)
         - PostgresKnowledgeLoader 초기화 (동적 지식)
         """
-        self.log.info("Light 모드 초기화 시작 (v53 Enhanced)")
+        self.log.info("Light 모드 초기화 시작")
         start = time.time()
 
         # === DB 모드 전용 (파일 모드 제거) ===
         if self.config.data_source_mode != "db":
-            self.log.error("v53 Enhanced는 DB 모드만 지원합니다.")
+            self.log.error("Enhanced는 DB 모드만 지원합니다.")
             raise RuntimeError(
                 "파일 모드는 더 이상 지원되지 않습니다. "
                 "config.data_source_mode='db'로 설정하세요."
@@ -7677,7 +7678,7 @@ class POSExtractorV52:
         self.specdb = LightweightSpecDBIndex(df=specdb_df)
         self.log.info(f"사양값DB 로드 완료: {len(specdb_df)}행")
 
-        # === 동적 지식 로더 초기화 (v53 Enhanced) ===
+        # === 동적 지식 로더 초기화 ===
         self.pg_knowledge_loader = PostgresKnowledgeLoader(
             conn=self.pg_loader.conn,  # 기존 연결 재사용
             logger=self.log
@@ -7694,7 +7695,7 @@ class POSExtractorV52:
                 f"약어 {len(self.pg_knowledge_loader.abbreviations)}개"
             )
 
-        # ReferenceHintEngine 초기화 (v53: 용어집/사양값DB 참조)
+        # ReferenceHintEngine 초기화 (용어집/사양값DB 참조)
         self.hint_engine = ReferenceHintEngine(
             glossary=self.glossary,
             specdb=self.specdb,
@@ -7713,7 +7714,7 @@ class POSExtractorV52:
         self._semantic_matcher_initialized = False
         self.log.info("SemanticMatcher: Lazy loading 모드")
 
-        # v53 Enhanced: LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
+        # LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
         if self.llm_fallback and self.pg_knowledge_loader:
             self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
             self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
@@ -7744,18 +7745,18 @@ class POSExtractorV52:
 
     def _init_full_mode(self, glossary_path: str, specdb_path: str):
         """
-        Full 모드 초기화 (v53 Enhanced: PostgreSQL 전용)
+        Full 모드 초기화 (PostgreSQL 전용)
 
-        v53 변경사항:
+        변경사항:
         - 파일 모드 제거 (DB 모드만 지원)
         - PostgresKnowledgeLoader 초기화 (동적 지식)
         """
-        self.log.info("Full 모드 초기화 시작 (v53 Enhanced)")
+        self.log.info("Full 모드 초기화 시작")
         start = time.time()
 
         # === DB 모드 전용 (파일 모드 제거) ===
         if self.config.data_source_mode != "db":
-            self.log.error("v53 Enhanced는 DB 모드만 지원합니다.")
+            self.log.error("Enhanced는 DB 모드만 지원합니다.")
             raise RuntimeError(
                 "파일 모드는 더 이상 지원되지 않습니다. "
                 "config.data_source_mode='db'로 설정하세요."
@@ -7786,7 +7787,7 @@ class POSExtractorV52:
         self.specdb = LightweightSpecDBIndex(df=specdb_df)
         self.log.info(f"사양값DB 로드 완료: {len(specdb_df)}행")
 
-        # === 동적 지식 로더 초기화 (v53 Enhanced) ===
+        # === 동적 지식 로더 초기화 ===
         self.pg_knowledge_loader = PostgresKnowledgeLoader(
             conn=self.pg_loader.conn,  # 기존 연결 재사용
             logger=self.log
@@ -7803,7 +7804,7 @@ class POSExtractorV52:
                 f"약어 {len(self.pg_knowledge_loader.abbreviations)}개"
             )
 
-        # ReferenceHintEngine 초기화 (v53: 용어집/사양값DB 참조)
+        # ReferenceHintEngine 초기화 (용어집/사양값DB 참조)
         self.hint_engine = ReferenceHintEngine(
             glossary=self.glossary,
             specdb=self.specdb,
@@ -7822,7 +7823,7 @@ class POSExtractorV52:
         self._semantic_matcher_initialized = False
         self.log.info("SemanticMatcher: Lazy loading 모드")
 
-        # v53 Enhanced: LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
+        # LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
         if self.llm_fallback and self.pg_knowledge_loader:
             self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
             self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
@@ -7846,7 +7847,7 @@ class POSExtractorV52:
         2. Pre-Check 검증
         3. 실패 시 LLM Fallback
         
-        v52.3: ReferenceHintEngine 힌트 활용
+        ReferenceHintEngine 힌트 활용
         """
         self.stats['total'] += 1
         
@@ -8084,7 +8085,7 @@ class POSExtractorV52:
             'value_format': self._detect_format(result.value),
             'umgv_uom': spec.expected_unit,
             'pos_chunk': result.chunk[:500] if result.chunk else '',
-            # v53: POS 원문 텍스트 보존 (대소문자, 특수문자 등 그대로)
+            # POS 원문 텍스트 보존 (대소문자, 특수문자 등 그대로)
             'pos_mat_attr_desc': result.original_equipment or spec.equipment,
             'pos_umgv_desc': result.original_spec_name or spec.spec_name,
             'pos_umgv_value': result.value,
@@ -9063,7 +9064,7 @@ class POSExtractorV52:
         matnr_column: str = "matnr"
     ) -> pd.DataFrame:
         """
-        파일 목록 기반 템플릿 필터링 (v52.4 개선)
+        파일 목록 기반 템플릿 필터링
         
         개선사항:
         - hull + POS 번호 조합으로 정확한 매칭
@@ -9172,7 +9173,7 @@ class POSExtractorV52:
         self.log.info("소량 추출 모드 (LIGHT) 시작")
         self.log.info("=" * 60)
 
-        # v53: GPU VRAM 모니터링
+        # GPU VRAM 모니터링
         log_gpu_memory(self.log)
         
         # POS 폴더 결정
@@ -9216,7 +9217,7 @@ class POSExtractorV52:
         # 추출 실행
         all_results = []
 
-        # v53: tqdm 진행도 표시
+        # tqdm 진행도 표시
         total_specs = len(filtered_df)
         for fname in tqdm(pos_files, desc="POS 파일 처리", unit="file"):
             html_path = os.path.join(pos_folder, fname)
@@ -9274,7 +9275,7 @@ class POSExtractorV52:
 
             self.log.info("처리 중: %s (hull=%s, %d specs)", fname, file_hull, len(file_rows))
 
-            # v53: 병렬 처리 (3-6 workers)
+            # 병렬 처리 (3-6 workers)
             specs_to_extract = []
             for _, row in file_rows.iterrows():
                 spec = self._row_to_spec_item(row, html_path)
@@ -9316,7 +9317,7 @@ class POSExtractorV52:
         self.log.info("  추출 결과: %d건", len(all_results))
         self.log.info("=" * 60)
 
-        # v53: GPU VRAM 모니터링 (완료 후)
+        # GPU VRAM 모니터링 (완료 후)
         log_gpu_memory(self.log)
 
         self.print_stats()
@@ -9350,7 +9351,7 @@ class POSExtractorV52:
         fname: str
     ) -> Dict[str, Any]:
         """
-        v53: 병렬 처리를 위한 wrapper 메서드
+        병렬 처리를 위한 wrapper 메서드
 
         extract_single을 호출하고 file_name을 추가합니다.
         Thread-safe한 단위 작업입니다.
@@ -9499,7 +9500,7 @@ class POSExtractorV52:
     def print_stats(self):
         """통계 출력"""
         self.log.info("=" * 60)
-        self.log.info("v52 추출 통계")
+        self.log.info("추출 통계")
         self.log.info("=" * 60)
         
         total = self.stats['total']
@@ -9525,18 +9526,18 @@ class POSExtractorV52:
 def main():
     """메인 실행 함수"""
     config = build_config()
-    
+
     logger.info("=" * 70)
-    logger.info("POS Extractor v52 (Optimized)")
+    logger.info("POS Extractor v61 (PostgreSQL-Enhanced)")
     logger.info("=" * 70)
     logger.info("추출 모드: %s", config.extraction_mode.upper())
     logger.info("데이터 소스: %s", config.data_source_mode.upper())
-    logger.info("출력: JSON=%s, CSV=%s, DB=%s", 
+    logger.info("출력: JSON=%s, CSV=%s, DB=%s",
                config.save_json, config.save_csv, config.save_to_db)
     logger.info("=" * 70)
-    
+
     # 추출기 초기화
-    extractor = POSExtractorV52(config=config)
+    extractor = POSExtractorV61(config=config)
     
     # 모드별 실행
     if config.extraction_mode == "light":
