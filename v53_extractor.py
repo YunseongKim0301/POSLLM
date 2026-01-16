@@ -2639,31 +2639,385 @@ class LightweightSpecDBIndex:
 
 
 # =============================================================================
-# Dynamic Knowledge Base (동적 지식 베이스 - 용어집 기반)
+# Dynamic Knowledge Base (동적 지식 베이스 - PostgreSQL 기반)
 # =============================================================================
+
+class PostgresKnowledgeLoader:
+    """
+    PostgreSQL에서 동적 지식 로드 (인메모리 캐싱)
+
+    보안망 환경을 고려하여 파일/SQLite 대신 인메모리 dict 사용:
+    - 프로그램 시작 시 PostgreSQL에서 1회 로드
+    - Python dict로 O(1) 조회
+    - 프로세스 종료 시 자동 삭제
+
+    테이블:
+    - pos_dict: 용어집 (umgv_desc, pos_umgv_desc, umgv_uom, pos_umgv_uom, mat_attr_desc)
+    - umgv_fin: 사양값DB (과거 추출 결과)
+    """
+
+    def __init__(self, config: Config = None, conn=None, logger: logging.Logger = None):
+        """
+        Args:
+            config: DB 설정 (config 또는 conn 중 하나 필요)
+            conn: 기존 PostgreSQL 연결 (재사용)
+            logger: 로거
+        """
+        self.config = config
+        self.conn = conn
+        self.log = logger or logging.getLogger("PGKnowledgeLoader")
+        self._own_connection = False
+
+        # 인메모리 캐시
+        self.synonym_forward = {}  # {standard: [variant1, variant2, ...]}
+        self.synonym_reverse = {}  # {variant: standard}
+        self.unit_forward = {}     # {standard_unit: [variant1, variant2, ...]}
+        self.unit_reverse = {}     # {variant_unit: standard_unit}
+        self.abbreviations = {}    # {abbrev: [full_form1, full_form2, ...]}
+        self.mat_attr_index = {}   # {umgv_desc: mat_attr_desc}
+
+        # 로드 상태
+        self._loaded = False
+
+        # 연결 확립
+        if not self.conn and config:
+            self._connect()
+
+    def _connect(self) -> bool:
+        """PostgreSQL 연결"""
+        if not HAS_PSYCOPG2:
+            self.log.warning("psycopg2 미설치. DB 지식 로더 비활성화")
+            return False
+
+        try:
+            self.conn = psycopg2.connect(
+                host=self.config.db_host,
+                port=self.config.db_port,
+                dbname=self.config.db_name,
+                user=self.config.db_user,
+                password=self.config.db_password,
+                connect_timeout=10
+            )
+            self._own_connection = True
+            self.log.info("PostgreSQL 지식 로더 연결 성공")
+            return True
+        except Exception as e:
+            self.log.error("PostgreSQL 지식 로더 연결 실패: %s", e)
+            return False
+
+    def load_all(self) -> bool:
+        """
+        모든 지식을 PostgreSQL에서 로드 (1회 호출)
+
+        Returns:
+            성공 여부
+        """
+        if self._loaded:
+            self.log.debug("이미 로드됨, 스킵")
+            return True
+
+        if not self.conn:
+            self.log.error("DB 연결 없음")
+            return False
+
+        try:
+            start_time = time.time()
+
+            # 1. 동의어 로드 (pos_dict 테이블)
+            self._load_synonyms()
+
+            # 2. 단위 변형 로드 (pos_dict 테이블)
+            self._load_units()
+
+            # 3. mat_attr_desc 인덱스 로드 (pos_dict 테이블)
+            self._load_mat_attr_index()
+
+            # 4. 약어 로드 (pos_dict 테이블 + 기본 약어)
+            self._load_abbreviations()
+
+            elapsed = time.time() - start_time
+            self.log.info(
+                f"지식 로드 완료: {elapsed:.2f}초 "
+                f"(동의어: {len(self.synonym_reverse)}, "
+                f"단위: {len(self.unit_reverse)}, "
+                f"약어: {len(self.abbreviations)})"
+            )
+
+            self._loaded = True
+            return True
+
+        except Exception as e:
+            self.log.error(f"지식 로드 실패: {e}")
+            self.log.debug(traceback.format_exc())
+            return False
+
+    def _load_synonyms(self):
+        """pos_dict에서 동의어 매핑 로드"""
+        try:
+            cur = self.conn.cursor()
+
+            # pos_dict 테이블에서 umgv_desc, pos_umgv_desc 조회
+            query = """
+                SELECT DISTINCT
+                    UPPER(TRIM(umgv_desc)) as standard_term,
+                    UPPER(TRIM(pos_umgv_desc)) as variant_term
+                FROM pos_dict
+                WHERE umgv_desc IS NOT NULL
+                  AND umgv_desc != ''
+                  AND pos_umgv_desc IS NOT NULL
+                  AND pos_umgv_desc != ''
+                  AND UPPER(TRIM(umgv_desc)) != UPPER(TRIM(pos_umgv_desc))
+            """
+
+            cur.execute(query)
+            rows = cur.fetchall()
+            cur.close()
+
+            count = 0
+            for standard, variant in rows:
+                # Forward mapping
+                if standard not in self.synonym_forward:
+                    self.synonym_forward[standard] = []
+                if variant not in self.synonym_forward[standard]:
+                    self.synonym_forward[standard].append(variant)
+
+                # Reverse mapping
+                self.synonym_reverse[variant] = standard
+                count += 1
+
+            self.log.debug(f"동의어 로드: {count}개 매핑")
+
+        except Exception as e:
+            self.log.warning(f"동의어 로드 실패: {e}")
+
+    def _load_units(self):
+        """pos_dict에서 단위 변형 매핑 로드"""
+        try:
+            # 기본 단위 변형 (하드코딩, 최소한만)
+            basic_variants = {
+                '°C': ['OC', 'oc', 'degC', 'deg C', 'degree C', 'celsius'],
+                'kW': ['KW', 'kw', 'kilowatt', 'kilowatts'],
+                'rpm': ['RPM', 'r/min', 'rev/min', 'revolutions per minute'],
+                'mm': ['MM', 'millimeter', 'millimeters'],
+                'm': ['M', 'meter', 'meters'],
+                'kg': ['KG', 'kilogram', 'kilograms'],
+                'bar': ['BAR', 'Bar'],
+                'L': ['l', 'liter', 'litre', 'liters', 'litres'],
+                'V': ['v', 'volt', 'volts'],
+                'A': ['a', 'amp', 'amps', 'ampere', 'amperes'],
+                'Hz': ['HZ', 'hz', 'hertz'],
+                'MPa': ['MPA', 'mpa', 'megapascal'],
+                'kPa': ['KPA', 'kpa', 'kilopascal'],
+            }
+
+            # 기본 변형 추가
+            for standard, variants in basic_variants.items():
+                self.unit_forward[standard] = list(variants)
+                for variant in variants:
+                    self.unit_reverse[variant] = standard
+                # 표준 단위 자신도 매핑
+                self.unit_reverse[standard] = standard
+
+            # pos_dict에서 추가 변형 로드
+            cur = self.conn.cursor()
+
+            query = """
+                SELECT DISTINCT
+                    TRIM(umgv_uom) as standard_unit,
+                    TRIM(pos_umgv_uom) as variant_unit
+                FROM pos_dict
+                WHERE umgv_uom IS NOT NULL
+                  AND umgv_uom != ''
+                  AND pos_umgv_uom IS NOT NULL
+                  AND pos_umgv_uom != ''
+                  AND TRIM(umgv_uom) != TRIM(pos_umgv_uom)
+            """
+
+            cur.execute(query)
+            rows = cur.fetchall()
+            cur.close()
+
+            count = len(self.unit_reverse)
+            for umgv_uom, pos_umgv_uom in rows:
+                # 표준 단위로 정규화 (기본 변형 사전에서 찾기)
+                standard_unit = self.unit_reverse.get(umgv_uom, umgv_uom)
+
+                if standard_unit not in self.unit_forward:
+                    self.unit_forward[standard_unit] = []
+
+                # pos_umgv_uom 추가
+                if pos_umgv_uom not in self.unit_forward[standard_unit]:
+                    self.unit_forward[standard_unit].append(pos_umgv_uom)
+                self.unit_reverse[pos_umgv_uom] = standard_unit
+
+            new_count = len(self.unit_reverse) - count
+            self.log.debug(f"단위 변형 로드: 기본 {count}개 + DB {new_count}개")
+
+        except Exception as e:
+            self.log.warning(f"단위 변형 로드 실패: {e}")
+
+    def _load_mat_attr_index(self):
+        """pos_dict에서 mat_attr_desc 인덱스 로드"""
+        try:
+            cur = self.conn.cursor()
+
+            query = """
+                SELECT DISTINCT
+                    UPPER(TRIM(umgv_desc)) as umgv_desc,
+                    TRIM(mat_attr_desc) as mat_attr_desc
+                FROM pos_dict
+                WHERE umgv_desc IS NOT NULL
+                  AND umgv_desc != ''
+                  AND mat_attr_desc IS NOT NULL
+                  AND mat_attr_desc != ''
+            """
+
+            cur.execute(query)
+            rows = cur.fetchall()
+            cur.close()
+
+            for umgv_desc, mat_attr_desc in rows:
+                # 하나의 umgv_desc가 여러 mat_attr_desc를 가질 수 있으므로
+                # 첫 번째 것만 저장 (또는 리스트로 관리)
+                if umgv_desc not in self.mat_attr_index:
+                    self.mat_attr_index[umgv_desc] = mat_attr_desc
+
+            self.log.debug(f"mat_attr 인덱스 로드: {len(self.mat_attr_index)}개")
+
+        except Exception as e:
+            self.log.warning(f"mat_attr 인덱스 로드 실패: {e}")
+
+    def _load_abbreviations(self):
+        """약어 로드 (기본 + pos_dict에서 패턴 추출)"""
+        # 기본 약어 (하드코딩, 최소한만)
+        basic_abbrevs = {
+            'M/E': ['Main Engine', 'Marine Engine'],
+            'G/E': ['Generator Engine', 'Generating Engine'],
+            'A/E': ['Auxiliary Engine'],
+            'MCR': ['Maximum Continuous Rating'],
+            'NCR': ['Normal Continuous Rating'],
+            'RPM': ['revolutions per minute', 'rev/min', 'r/min'],
+            'KW': ['kilowatt', 'kW'],
+            'HP': ['horsepower', 'bhp'],
+        }
+
+        self.abbreviations.update(basic_abbrevs)
+
+        # pos_dict에서 패턴 추출 (향후 구현 가능)
+        # 예: pos_umgv_desc에서 "Full Form (ABBREV)" 패턴
+        try:
+            cur = self.conn.cursor()
+
+            query = """
+                SELECT DISTINCT TRIM(pos_umgv_desc) as pos_desc
+                FROM pos_dict
+                WHERE pos_umgv_desc IS NOT NULL
+                  AND pos_umgv_desc LIKE '%(%'
+                LIMIT 1000
+            """
+
+            cur.execute(query)
+            rows = cur.fetchall()
+            cur.close()
+
+            for (pos_desc,) in rows:
+                # 패턴: "Full Form (ABBREV)"
+                match = re.search(r'(.+?)\s*\(([A-Z/]+)\)', pos_desc)
+                if match:
+                    full_form = match.group(1).strip()
+                    abbrev = match.group(2).strip()
+
+                    if abbrev not in self.abbreviations:
+                        self.abbreviations[abbrev] = []
+                    if full_form not in self.abbreviations[abbrev]:
+                        self.abbreviations[abbrev].append(full_form)
+
+            self.log.debug(f"약어 로드: {len(self.abbreviations)}개")
+
+        except Exception as e:
+            self.log.warning(f"약어 로드 실패: {e}")
+
+    # === 조회 메서드 (기존 FuzzyMatcher/UnitNormalizer와 호환) ===
+
+    def get_standard_term(self, variant: str) -> str:
+        """변형 용어를 표준 용어로 변환"""
+        if not variant:
+            return variant
+        variant_upper = norm(variant).upper()
+        return self.synonym_reverse.get(variant_upper, variant)
+
+    def get_synonyms(self, standard_term: str) -> List[str]:
+        """표준 용어의 모든 동의어 반환"""
+        standard_upper = norm(standard_term).upper()
+        return self.synonym_forward.get(standard_upper, [])
+
+    def is_synonym(self, term1: str, term2: str) -> bool:
+        """두 용어가 동의어 관계인지 확인"""
+        std1 = self.get_standard_term(term1)
+        std2 = self.get_standard_term(term2)
+        return std1.upper() == std2.upper()
+
+    def normalize_unit(self, unit: str) -> str:
+        """단위를 표준 형태로 정규화"""
+        if not unit:
+            return unit
+
+        # 직접 매칭
+        if unit in self.unit_reverse:
+            return self.unit_reverse[unit]
+
+        # 대소문자 무시 검색
+        unit_lower = unit.lower()
+        for variant, standard in self.unit_reverse.items():
+            if variant.lower() == unit_lower:
+                return standard
+
+        # 매칭 실패 시 원본 반환
+        return unit
+
+    def get_unit_variants(self, unit: str) -> List[str]:
+        """표준 단위의 모든 변형 반환"""
+        standard = self.normalize_unit(unit)
+        return self.unit_forward.get(standard, [unit])
+
+    def is_unit_variant_of(self, unit1: str, unit2: str) -> bool:
+        """두 단위가 동일한지 확인 (변형 포함)"""
+        return self.normalize_unit(unit1) == self.normalize_unit(unit2)
+
+    def get_abbreviation_expansions(self, text: str) -> List[str]:
+        """약어를 모든 가능한 확장으로 변환"""
+        expansions = [text]
+
+        for abbrev, full_forms in self.abbreviations.items():
+            if abbrev in text.upper():
+                for full_form in full_forms:
+                    expanded = re.sub(abbrev, full_form, text, flags=re.IGNORECASE)
+                    if expanded not in expansions:
+                        expansions.append(expanded)
+
+        return expansions
+
+    def get_mat_attr_desc(self, umgv_desc: str) -> str:
+        """umgv_desc에 대한 mat_attr_desc 반환"""
+        umgv_upper = norm(umgv_desc).upper()
+        return self.mat_attr_index.get(umgv_upper, "")
+
+    def close(self):
+        """연결 종료 (자신이 생성한 연결만)"""
+        if self._own_connection and self.conn:
+            try:
+                self.conn.close()
+                self.log.debug("PostgreSQL 지식 로더 연결 종료")
+            except:
+                pass
+
 
 class KnowledgeCacheBuilder:
     """
-    용어집/사양값DB에서 동적 지식 캐시 생성
+    ⚠️ DEPRECATED: 파일 기반 캐시 빌더 (PostgresKnowledgeLoader 사용 권장)
 
-    별도 DB 없이 JSON 캐시 파일로 관리:
-    - synonyms_cache.json: umgv_desc ↔ pos_umgv_desc
-    - units_cache.json: umgv_uom ↔ pos_umgv_uom
-    - abbreviations_cache.json: 약어 ↔ 전체 형태
+    보안망 환경에서는 PostgresKnowledgeLoader를 사용하세요.
     """
-
-    CACHE_DIR = "knowledge_base/data"
-
-    @staticmethod
-    def ensure_cache_dir():
-        """캐시 디렉토리 생성"""
-        os.makedirs(KnowledgeCacheBuilder.CACHE_DIR, exist_ok=True)
-
-    @staticmethod
-    def get_cache_path(cache_name: str) -> str:
-        """캐시 파일 경로 반환"""
-        KnowledgeCacheBuilder.ensure_cache_dir()
-        return os.path.join(KnowledgeCacheBuilder.CACHE_DIR, cache_name)
 
     @staticmethod
     def build_synonym_cache(glossary_df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -2882,139 +3236,68 @@ class KnowledgeCacheBuilder:
 
 class UnitNormalizer:
     """
-    단위 정규화 (동적 캐시 기반)
+    단위 정규화 (PostgreSQL 기반)
 
-    용어집의 umgv_uom ↔ pos_umgv_uom을 활용하여 단위 변형 인식
+    PostgresKnowledgeLoader를 래핑하여 기존 인터페이스 유지
     """
 
-    _instance = None
-    _cache_loaded = False
-
-    def __new__(cls):
-        """싱글톤 패턴"""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        if not UnitNormalizer._cache_loaded:
-            self._load_cache()
-            UnitNormalizer._cache_loaded = True
-
-    def _load_cache(self):
-        """캐시 로드"""
-        cache_data = KnowledgeCacheBuilder.load_cache('units_cache.json')
-
-        if not cache_data:
-            # 캐시가 없으면 기본값만 사용
-            print("[WARN] Unit cache not found, using basic variants only")
-            cache_data = KnowledgeCacheBuilder.build_unit_cache(None)
-            KnowledgeCacheBuilder.save_cache(cache_data, 'units_cache.json')
-
-        self.forward_map = cache_data.get('forward', {})
-        self.reverse_map = cache_data.get('reverse', {})
+    def __init__(self, pg_loader: PostgresKnowledgeLoader = None):
+        """
+        Args:
+            pg_loader: PostgresKnowledgeLoader 인스턴스 (공유)
+        """
+        self.pg_loader = pg_loader
 
     def normalize(self, unit: str) -> str:
-        """
-        단위를 표준 형태로 정규화
-
-        Args:
-            unit: 입력 단위 (예: "OC", "kw", "RPM")
-
-        Returns:
-            표준 단위 (예: "°C", "kW", "rpm")
-        """
-        if not unit:
+        """단위를 표준 형태로 정규화"""
+        if not self.pg_loader:
             return unit
-
-        # 직접 매칭
-        if unit in self.reverse_map:
-            return self.reverse_map[unit]
-
-        # 대소문자 무시 검색
-        unit_lower = unit.lower()
-        for variant, standard in self.reverse_map.items():
-            if variant.lower() == unit_lower:
-                return standard
-
-        # 매칭 실패 시 원본 반환
-        return unit
+        return self.pg_loader.normalize_unit(unit)
 
     def get_variants(self, unit: str) -> List[str]:
-        """
-        표준 단위의 모든 변형 반환
-
-        Args:
-            unit: 표준 단위 (예: "°C")
-
-        Returns:
-            변형 리스트 (예: ["OC", "oc", "degC", ...])
-        """
-        standard = self.normalize(unit)
-        return self.forward_map.get(standard, [unit])
+        """표준 단위의 모든 변형 반환"""
+        if not self.pg_loader:
+            return [unit]
+        return self.pg_loader.get_unit_variants(unit)
 
     def is_variant_of(self, unit1: str, unit2: str) -> bool:
         """두 단위가 동일한지 확인 (변형 포함)"""
-        return self.normalize(unit1) == self.normalize(unit2)
+        if not self.pg_loader:
+            return unit1 == unit2
+        return self.pg_loader.is_unit_variant_of(unit1, unit2)
 
 
 class FuzzyMatcher:
     """
-    Fuzzy string matching (동적 동의어 캐시 기반)
+    Fuzzy string matching (PostgreSQL 기반)
 
-    용어집의 umgv_desc ↔ pos_umgv_desc를 활용하여 동의어 인식
+    PostgresKnowledgeLoader를 래핑하여 기존 인터페이스 유지
     """
 
-    _instance = None
-    _cache_loaded = False
-
-    def __new__(cls):
-        """싱글톤 패턴"""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        if not FuzzyMatcher._cache_loaded:
-            self._load_cache()
-            FuzzyMatcher._cache_loaded = True
-
-    def _load_cache(self):
-        """캐시 로드"""
-        cache_data = KnowledgeCacheBuilder.load_cache('synonyms_cache.json')
-
-        if not cache_data:
-            print("[WARN] Synonym cache not found, using empty cache")
-            cache_data = {'forward': {}, 'reverse': {}}
-            KnowledgeCacheBuilder.save_cache(cache_data, 'synonyms_cache.json')
-
-        self.forward_map = cache_data.get('forward', {})
-        self.reverse_map = cache_data.get('reverse', {})
+    def __init__(self, pg_loader: PostgresKnowledgeLoader = None):
+        """
+        Args:
+            pg_loader: PostgresKnowledgeLoader 인스턴스 (공유)
+        """
+        self.pg_loader = pg_loader
 
     def get_standard_term(self, variant: str) -> str:
         """변형 용어를 표준 용어로 변환"""
-        if not variant:
+        if not self.pg_loader:
             return variant
-
-        variant_norm = norm(variant).upper()
-
-        # 역방향 맵에서 찾기
-        if variant_norm in self.reverse_map:
-            return self.reverse_map[variant_norm]
-
-        # 매칭 실패 시 원본 반환
-        return variant
+        return self.pg_loader.get_standard_term(variant)
 
     def get_synonyms(self, standard_term: str) -> List[str]:
         """표준 용어의 모든 동의어 반환"""
-        standard_norm = norm(standard_term).upper()
-        return self.forward_map.get(standard_norm, [])
+        if not self.pg_loader:
+            return []
+        return self.pg_loader.get_synonyms(standard_term)
 
     def is_synonym(self, term1: str, term2: str) -> bool:
         """두 용어가 동의어 관계인지 확인"""
-        std1 = self.get_standard_term(term1)
-        std2 = self.get_standard_term(term2)
-        return std1.upper() == std2.upper()
+        if not self.pg_loader:
+            return False
+        return self.pg_loader.is_synonym(term1, term2)
 
     def ratio(self, s1: str, s2: str) -> float:
         """
@@ -3054,66 +3337,29 @@ class FuzzyMatcher:
 
 class AbbreviationExpander:
     """
-    약어 확장 (동적 캐시 기반)
+    약어 확장 (PostgreSQL 기반)
 
-    POS 문서에서 자주 사용되는 약어를 전체 형태로 확장
+    PostgresKnowledgeLoader를 래핑하여 기존 인터페이스 유지
     """
 
-    _instance = None
-    _cache_loaded = False
-
-    def __new__(cls):
-        """싱글톤 패턴"""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        if not AbbreviationExpander._cache_loaded:
-            self._load_cache()
-            AbbreviationExpander._cache_loaded = True
-
-    def _load_cache(self):
-        """캐시 로드"""
-        cache_data = KnowledgeCacheBuilder.load_cache('abbreviations_cache.json')
-
-        if not cache_data:
-            print("[WARN] Abbreviation cache not found, using basic abbreviations")
-            cache_data = KnowledgeCacheBuilder.build_abbreviation_cache(None)
-            KnowledgeCacheBuilder.save_cache(cache_data, 'abbreviations_cache.json')
-
-        self.abbrev_map = cache_data
+    def __init__(self, pg_loader: PostgresKnowledgeLoader = None):
+        """
+        Args:
+            pg_loader: PostgresKnowledgeLoader 인스턴스 (공유)
+        """
+        self.pg_loader = pg_loader
 
     def expand(self, text: str) -> List[str]:
-        """
-        약어를 모든 가능한 확장으로 변환
-
-        Args:
-            text: 입력 텍스트 (예: "M/E OUTPUT")
-
-        Returns:
-            확장된 형태들 (예: ["M/E OUTPUT", "Main Engine OUTPUT", "Marine Engine OUTPUT"])
-        """
-        expansions = [text]
-
-        for abbrev, full_forms in self.abbrev_map.items():
-            if abbrev in text.upper():
-                for full_form in full_forms:
-                    # 대소문자 보존하면서 치환
-                    expanded = re.sub(
-                        abbrev,
-                        full_form,
-                        text,
-                        flags=re.IGNORECASE
-                    )
-                    if expanded not in expansions:
-                        expansions.append(expanded)
-
-        return expansions
+        """약어를 모든 가능한 확장으로 변환"""
+        if not self.pg_loader:
+            return [text]
+        return self.pg_loader.get_abbreviation_expansions(text)
 
     def get_full_forms(self, abbrev: str) -> List[str]:
         """약어의 모든 전체 형태 반환"""
-        return self.abbrev_map.get(abbrev.upper(), [])
+        if not self.pg_loader:
+            return []
+        return self.pg_loader.abbreviations.get(abbrev.upper(), [])
 
 
 # =============================================================================
@@ -4779,28 +5025,38 @@ class ChunkCandidateGenerator:
         chunk_parser: HTMLChunkParser,
         glossary: LightweightGlossaryIndex = None,
         logger: logging.Logger = None,
-        use_dynamic_knowledge: bool = True
+        use_dynamic_knowledge: bool = True,
+        pg_knowledge_loader: PostgresKnowledgeLoader = None  # v53 Enhanced
     ):
         self.section_parser = section_parser
         self.chunk_parser = chunk_parser
         self.glossary = glossary
         self.log = logger or logging.getLogger(__name__)
 
-        # Dynamic knowledge components (lazy initialization)
+        # Dynamic knowledge components (PostgreSQL 기반)
         self.use_dynamic_knowledge = use_dynamic_knowledge
+        self.pg_knowledge_loader = pg_knowledge_loader
         self.fuzzy_matcher = None
         self.unit_normalizer = None
         self.abbreviation_expander = None
 
-        if use_dynamic_knowledge:
+        if use_dynamic_knowledge and pg_knowledge_loader:
             self._init_dynamic_components()
 
     def _init_dynamic_components(self):
-        """동적 지식 컴포넌트 초기화 (lazy)"""
+        """동적 지식 컴포넌트 초기화 (PostgreSQL 기반)"""
         try:
-            self.fuzzy_matcher = FuzzyMatcher()
-            self.unit_normalizer = UnitNormalizer()
-            self.abbreviation_expander = AbbreviationExpander()
+            if not self.pg_knowledge_loader:
+                self.log.warning("PostgresKnowledgeLoader not provided, disabling dynamic knowledge")
+                self.use_dynamic_knowledge = False
+                return
+
+            # PostgresKnowledgeLoader를 공유하는 래퍼 생성
+            self.fuzzy_matcher = FuzzyMatcher(self.pg_knowledge_loader)
+            self.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
+            self.abbreviation_expander = AbbreviationExpander(self.pg_knowledge_loader)
+
+            self.log.debug("Dynamic knowledge components initialized (PostgreSQL-based)")
         except Exception as e:
             self.log.warning(f"Failed to initialize dynamic components: {e}")
             self.use_dynamic_knowledge = False
@@ -6475,16 +6731,10 @@ class LLMFallbackExtractor:
         self.chunk_expander = None
         self._enhanced_components_initialized = False
 
-        # v53 Enhanced: 동적 지식 컴포넌트
+        # v53 Enhanced: 동적 지식 컴포넌트 (PostgreSQL 기반)
         self.use_dynamic_knowledge = use_dynamic_knowledge
+        self.pg_knowledge_loader = None  # POSExtractorV52에서 주입
         self.unit_normalizer = None
-
-        if use_dynamic_knowledge:
-            try:
-                self.unit_normalizer = UnitNormalizer()
-            except Exception as e:
-                self.log.warning(f"Failed to initialize UnitNormalizer: {e}")
-                self.use_dynamic_knowledge = False
     
     def _init_enhanced_components(self, parser: HTMLChunkParser):
         """
@@ -7378,43 +7628,64 @@ class POSExtractorV52:
     
     def _init_light_mode(self, glossary_path: str, specdb_path: str):
         """
-        Light 모드 초기화 (최적화)
-        
-        DATA_SOURCE_MODE에 따라:
-        - "file": 파일에서 용어집/사양값DB 로드
-        - "db": PostgreSQL에서 용어집/사양값DB 로드
-        
-        v52.3: ReferenceHintEngine 추가 (용어집/사양값DB 참조 힌트)
+        Light 모드 초기화 (v53 Enhanced: PostgreSQL 전용)
+
+        v53 변경사항:
+        - 파일 모드 제거 (DB 모드만 지원)
+        - PostgresKnowledgeLoader 초기화 (동적 지식)
         """
-        self.log.info("Light 모드 초기화 시작 (최적화)")
+        self.log.info("Light 모드 초기화 시작 (v53 Enhanced)")
         start = time.time()
-        
-        # DATA_SOURCE_MODE에 따라 용어집/사양값DB 로드
-        if self.config.data_source_mode == "db":
-            # DB 모드: PostgreSQL에서 로드
-            self.log.info("데이터 소스: DB 모드")
 
-            # pos_embedding DB 연결
-            try:
-                self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
-            except Exception as e:
-                self.log.error("PostgreSQL 연결 실패: %s", e)
-                self.log.error("DB 모드에서는 PostgreSQL 연결이 필수입니다. 프로그램을 종료합니다.")
-                raise RuntimeError(f"PostgreSQL 연결 실패: {e}")
+        # === DB 모드 전용 (파일 모드 제거) ===
+        if self.config.data_source_mode != "db":
+            self.log.error("v53 Enhanced는 DB 모드만 지원합니다.")
+            raise RuntimeError(
+                "파일 모드는 더 이상 지원되지 않습니다. "
+                "config.data_source_mode='db'로 설정하세요."
+            )
 
-            # 용어집 로드 (pos_dict 테이블)
-            glossary_df = self.pg_loader.load_glossary_from_db()
-            if glossary_df.empty:
-                self.log.error("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다.")
-                raise RuntimeError("용어집 로드 실패")
-            self.glossary = LightweightGlossaryIndex(df=glossary_df)
+        self.log.info("데이터 소스: DB 모드 (PostgreSQL)")
 
-            # 사양값DB 로드 (umgv_fin 테이블)
-            specdb_df = self.pg_loader.load_specdb_from_db()
-            if specdb_df.empty:
-                self.log.error("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다.")
-                raise RuntimeError("사양값DB 로드 실패")
-            self.specdb = LightweightSpecDBIndex(df=specdb_df)
+        # PostgreSQL 연결
+        try:
+            self.pg_loader = PostgresEmbeddingLoader(self.config, self.log)
+        except Exception as e:
+            self.log.error(f"PostgreSQL 연결 실패: {e}")
+            raise RuntimeError(f"PostgreSQL 연결 필수: {e}")
+
+        # 용어집 로드 (pos_dict 테이블)
+        glossary_df = self.pg_loader.load_glossary_from_db()
+        if glossary_df.empty:
+            self.log.error("용어집(pos_dict) 로드 실패")
+            raise RuntimeError("용어집(pos_dict) 로드 실패: 데이터가 비어있습니다")
+        self.glossary = LightweightGlossaryIndex(df=glossary_df)
+        self.log.info(f"용어집 로드 완료: {len(glossary_df)}행")
+
+        # 사양값DB 로드 (umgv_fin 테이블)
+        specdb_df = self.pg_loader.load_specdb_from_db()
+        if specdb_df.empty:
+            self.log.error("사양값DB(umgv_fin) 로드 실패")
+            raise RuntimeError("사양값DB(umgv_fin) 로드 실패: 데이터가 비어있습니다")
+        self.specdb = LightweightSpecDBIndex(df=specdb_df)
+        self.log.info(f"사양값DB 로드 완료: {len(specdb_df)}행")
+
+        # === 동적 지식 로더 초기화 (v53 Enhanced) ===
+        self.pg_knowledge_loader = PostgresKnowledgeLoader(
+            conn=self.pg_loader.conn,  # 기존 연결 재사용
+            logger=self.log
+        )
+
+        # 지식 로드 (1회, 수초 소요)
+        if not self.pg_knowledge_loader.load_all():
+            self.log.warning("동적 지식 로드 실패, 기본 기능만 사용")
+        else:
+            self.log.info(
+                f"동적 지식 로드 완료: "
+                f"동의어 {len(self.pg_knowledge_loader.synonym_reverse)}개, "
+                f"단위 {len(self.pg_knowledge_loader.unit_reverse)}개, "
+                f"약어 {len(self.pg_knowledge_loader.abbreviations)}개"
+            )
         else:
             # 파일 모드: 로컬 파일에서 로드
             self.log.info("데이터 소스: 파일 모드")
