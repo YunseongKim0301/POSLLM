@@ -7558,26 +7558,30 @@ class POSExtractorV61:
     ):
         self.config = config or build_config()
         self.log = logging.getLogger("POSExtractorV61")
-        
-        # 모드별 초기화
+
+        # LLM 관련 속성 사전 초기화 (모드 초기화 전에 선언)
+        self.llm_client = None
+        self.llm_validator = None
+        self.llm_fallback = None
+        self.pg_knowledge_loader = None
+
+        # 모드별 초기화 (glossary, specdb, pg_knowledge_loader 생성)
         if self.config.extraction_mode == "light":
             self._init_light_mode(glossary_path, specdb_path)
         elif self.config.extraction_mode == "verify":
             self._init_verify_mode(glossary_path, specdb_path)
         else:
             self._init_full_mode(glossary_path, specdb_path)
-        
+
         # 공통 컴포넌트
         self.pre_checker = ImprovedPreChecker()
         self.rule_extractor = RuleBasedExtractor(self.glossary, self.specdb)
 
-        # ValueValidator 초기화 (v2에서 추가)
+        # ValueValidator 초기화
         self.value_validator = ValueValidator(self.config)
         self.log.info("ValueValidator 초기화 완료")
 
         # UnifiedLLMClient 초기화 (모든 LLM 호출에 사용)
-        self.llm_client = None
-        self.llm_validator = None
         if self.config.use_llm:
             self.llm_client = UnifiedLLMClient(
                 ollama_host=self.config.ollama_host,
@@ -7597,8 +7601,7 @@ class POSExtractorV61:
             self.llm_validator = LLMValidator(self.llm_client, self.config, self.log)
             self.log.info("LLMValidator 초기화 완료 (모든 추출 결과 LLM 검증)")
 
-        # LLM Fallback 초기화 (UnifiedLLMClient와 연동하여 Voting 지원)
-        self.llm_fallback = None
+        # LLM Fallback 초기화 (모드 초기화 후, glossary 사용 가능)
         if self.config.use_llm and self.config.enable_llm_fallback:
             self.llm_fallback = LLMFallbackExtractor(
                 ollama_host=self.config.ollama_host,
@@ -7606,15 +7609,21 @@ class POSExtractorV61:
                 model=self.config.ollama_model,
                 timeout=self.config.ollama_timeout,
                 logger=self.log,
-                llm_client=self.llm_client,  # UnifiedLLMClient 전달
-                use_voting=self.config.vote_enabled,  # Config의 voting 설정 사용
-                glossary=self.glossary,  # glossary 전달
-                enable_enhanced_chunk_selection=True,  # Enhanced chunk selection
-                use_dynamic_knowledge=True  # 동적 지식 활성화
+                llm_client=self.llm_client,
+                use_voting=self.config.vote_enabled,
+                glossary=self.glossary,  # 모드 초기화에서 생성됨
+                enable_enhanced_chunk_selection=True,
+                use_dynamic_knowledge=True
             )
             voting_status = "Voting 활성화" if self.config.vote_enabled else "단일 호출"
             self.log.info("LLM Fallback 초기화: %s (ports: %s, %s)",
                          self.config.ollama_model, self.config.ollama_ports, voting_status)
+
+            # PostgresKnowledgeLoader를 LLMFallbackExtractor에 주입
+            if self.pg_knowledge_loader:
+                self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
+                self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
+                self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
 
         # 통계
         self.stats = {
@@ -7629,10 +7638,6 @@ class POSExtractorV61:
 
         # 파서 캐시
         self._parser_cache: Dict[str, HTMLChunkParser] = {}
-
-        # PostgresKnowledgeLoader 주입 (모드 초기화 후)
-        # pg_knowledge_loader는 _init_*_mode()에서 생성됨
-        self.pg_knowledge_loader = None  # 초기화, _init_*_mode에서 설정됨
     
     def _init_light_mode(self, glossary_path: str, specdb_path: str):
         """
@@ -7713,12 +7718,6 @@ class POSExtractorV61:
         self.semantic_matcher = None
         self._semantic_matcher_initialized = False
         self.log.info("SemanticMatcher: Lazy loading 모드")
-
-        # LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
-        if self.llm_fallback and self.pg_knowledge_loader:
-            self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
-            self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
-            self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
 
         elapsed = time.time() - start
         self.log.info(f"Light 모드 초기화 완료: {elapsed:.2f}초")
@@ -7822,12 +7821,6 @@ class POSExtractorV61:
         self.semantic_matcher = None
         self._semantic_matcher_initialized = False
         self.log.info("SemanticMatcher: Lazy loading 모드")
-
-        # LLMFallbackExtractor에 PostgresKnowledgeLoader 주입
-        if self.llm_fallback and self.pg_knowledge_loader:
-            self.llm_fallback.pg_knowledge_loader = self.pg_knowledge_loader
-            self.llm_fallback.unit_normalizer = UnitNormalizer(self.pg_knowledge_loader)
-            self.log.info("LLMFallbackExtractor: 동적 지식 통합 완료")
 
         elapsed = time.time() - start
         self.log.info(f"Full 모드 초기화 완료: {elapsed:.2f}초")
