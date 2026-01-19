@@ -6867,6 +6867,10 @@ class RuleBasedExtractor:
 
             if value:
                 confidence = best_candidate.quality_score * 0.9  # quality score 기반
+                # chunk에서 원본 사양명 추출
+                original_spec_name = self._extract_original_spec_name_from_chunk(
+                    chunk_text, spec, hint
+                )
                 return ExtractionResult(
                     spec_item=spec,
                     value=value,
@@ -6874,7 +6878,9 @@ class RuleBasedExtractor:
                     chunk=chunk_text[:500],  # 500자 제한
                     method="RULE_ENHANCED_CHUNK",
                     confidence=confidence,
-                    reference_source=f"enhanced:{best_candidate.source}"
+                    reference_source=f"enhanced:{best_candidate.source}",
+                    original_spec_name=original_spec_name,
+                    original_unit=unit  # 원본 단위 보존
                 )
 
             return None
@@ -7005,7 +7011,105 @@ class RuleBasedExtractor:
                     variants.append(syn)
 
         return variants
-    
+
+    def _extract_original_spec_name_from_chunk(
+        self,
+        chunk: str,
+        spec: SpecItem,
+        hint: ExtractionHint = None
+    ) -> str:
+        """
+        Chunk 텍스트에서 원본 사양명 추출
+
+        목표: POS 문서에 실제로 적혀있는 사양명을 그대로 추출
+        예: "Hoisting capacity | SWL 6 tonnes" → "Hoisting capacity"
+
+        전략:
+        1. spec.spec_name과 동의어들을 chunk에서 검색
+        2. 대소문자 구분 없이 찾되, 원본 표기 그대로 반환
+        3. 매칭된 부분의 원본 텍스트를 추출
+
+        Args:
+            chunk: POS 문서 chunk 텍스트
+            spec: 사양 항목
+            hint: 추출 힌트
+
+        Returns:
+            원본 사양명 (chunk에서 추출) 또는 빈 문자열
+        """
+        if not chunk:
+            return ""
+
+        # 검색할 사양명 변형 목록 (원본 + 동의어)
+        variants = self._get_spec_name_variants(spec.spec_name, hint)
+
+        # 각 변형에 대해 chunk에서 검색
+        for variant in variants:
+            # 대소문자 구분 없이 검색
+            pattern = re.compile(re.escape(variant), re.IGNORECASE)
+            match = pattern.search(chunk)
+
+            if match:
+                # 매칭된 원본 텍스트 반환 (대소문자 보존)
+                original_text = match.group(0)
+
+                # 주변 컨텍스트 확인하여 정확한 사양명 경계 찾기
+                # 예: "Hoisting capacity: 6 tonnes" → "Hoisting capacity"
+                # 또는 "CAPACITY (SWL)" → "CAPACITY"
+
+                # 매칭 위치
+                start_pos = match.start()
+                end_pos = match.end()
+
+                # 앞쪽으로 확장 (가능한 경우)
+                # 예: "Hoisting capacity" 전체를 잡기 위해
+                extended_start = start_pos
+                while extended_start > 0 and chunk[extended_start - 1].isalpha():
+                    extended_start -= 1
+
+                # 뒤쪽으로 확장
+                extended_end = end_pos
+                # | : - 등의 구분자 전까지 확장
+                while extended_end < len(chunk):
+                    char = chunk[extended_end]
+                    if char in ['|', ':', '/', '=', '\n', '\t']:
+                        break
+                    if char.isalnum() or char.isspace() or char in ['(', ')']:
+                        extended_end += 1
+                    else:
+                        break
+
+                # 확장된 텍스트 추출 및 정리
+                extended_text = chunk[extended_start:extended_end].strip()
+
+                # 괄호 제거 및 정리
+                # 예: "CAPACITY (SWL)" → "CAPACITY"
+                # 단, 괄호가 값 표기인 경우는 보존
+                # 사양명 부분만 추출 (값은 제외)
+                spec_name_part = extended_text.split('|')[0].strip()  # | 앞부분만
+                spec_name_part = spec_name_part.split(':')[0].strip()  # : 앞부분만
+                spec_name_part = spec_name_part.split('/')[0].strip()  # / 앞부분만 (일부 경우)
+
+                # 괄호 처리: 사양명에 괄호가 포함된 경우와 아닌 경우 구분
+                # 예: "CAPACITY (SWL)" vs "Capacity: 6 (tonnes)"
+                # 간단한 휴리스틱: 괄호 안이 단위나 약어가 아니면 제거
+                if '(' in spec_name_part:
+                    # 괄호 앞부분만 추출 (보수적 접근)
+                    spec_name_part = spec_name_part.split('(')[0].strip()
+
+                # 최종 정리
+                spec_name_part = spec_name_part.strip()
+
+                if spec_name_part and len(spec_name_part) >= 3:
+                    self.log.debug(
+                        f"Extracted original spec name: '{spec_name_part}' "
+                        f"(from variant: '{variant}', chunk: '{chunk[:100]}')"
+                    )
+                    return spec_name_part
+
+        # 매칭 실패시 빈 문자열
+        return ""
+
     def extract(
         self,
         parser: HTMLChunkParser,
@@ -7055,6 +7159,10 @@ class RuleBasedExtractor:
                         value, unit, chunk = result
                         if value:
                             confidence = self._calculate_confidence(spec, value, unit, hint)
+                            # chunk에서 원본 사양명 추출
+                            original_spec_name = self._extract_original_spec_name_from_chunk(
+                                chunk, spec, hint
+                            )
                             return ExtractionResult(
                                 spec_item=spec,
                                 value=value,
@@ -7062,7 +7170,9 @@ class RuleBasedExtractor:
                                 chunk=chunk,
                                 method="RULE_SECTION_HINT",
                                 confidence=confidence,
-                                reference_source=f"section:{hint.section_num}"
+                                reference_source=f"section:{hint.section_num}",
+                                original_spec_name=original_spec_name,
+                                original_unit=unit
                             )
 
         # table_text 힌트에 따라 검색 우선순위 조정
@@ -7086,6 +7196,10 @@ class RuleBasedExtractor:
                         # 동의어로 찾은 경우 약간 낮은 신뢰도
                         if variant != spec.spec_name:
                             confidence *= 0.95
+                        # chunk에서 원본 사양명 추출
+                        original_spec_name = self._extract_original_spec_name_from_chunk(
+                            chunk, spec, hint
+                        )
                         return ExtractionResult(
                             spec_item=spec,
                             value=value,
@@ -7093,7 +7207,9 @@ class RuleBasedExtractor:
                             chunk=chunk,
                             method="RULE_TABLE_DIRECT",
                             confidence=confidence,
-                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                            reference_source=f"table_text:{hint.table_text}" if hint else "",
+                            original_spec_name=original_spec_name,
+                            original_unit=unit
                         )
 
         # 전략 1b: 텍스트 검색 (table_text=N이면 우선)
@@ -7110,6 +7226,10 @@ class RuleBasedExtractor:
                             confidence *= 1.1  # 10% 보너스
                         if variant != spec.spec_name:
                             confidence *= 0.95
+                        # chunk에서 원본 사양명 추출
+                        original_spec_name = self._extract_original_spec_name_from_chunk(
+                            chunk, spec, hint
+                        )
                         return ExtractionResult(
                             spec_item=spec,
                             value=value,
@@ -7117,7 +7237,9 @@ class RuleBasedExtractor:
                             chunk=chunk,
                             method="RULE_TEXT_SEARCH",
                             confidence=confidence,
-                            reference_source=f"table_text:{hint.table_text}" if hint else ""
+                            reference_source=f"table_text:{hint.table_text}" if hint else "",
+                            original_spec_name=original_spec_name,
+                            original_unit=unit
                         )
 
         # 전략 2: 반대 방향 검색 (테이블 우선이었으면 텍스트, 텍스트 우선이었으면 테이블)
@@ -7132,13 +7254,19 @@ class RuleBasedExtractor:
                         confidence = self._calculate_confidence(spec, value, unit) * 0.85  # 힌트 불일치로 낮은 신뢰도
                         if variant != spec.spec_name:
                             confidence *= 0.95
+                        # chunk에서 원본 사양명 추출
+                        original_spec_name = self._extract_original_spec_name_from_chunk(
+                            chunk, spec, hint
+                        )
                         return ExtractionResult(
                             spec_item=spec,
                             value=value,
                             unit=unit or spec.expected_unit,
                             chunk=chunk,
                             method="RULE_TEXT_FALLBACK",
-                            confidence=confidence
+                            confidence=confidence,
+                            original_spec_name=original_spec_name,
+                            original_unit=unit
                         )
         else:
             # 텍스트에서 못 찾았으면 테이블 시도
@@ -7151,13 +7279,19 @@ class RuleBasedExtractor:
                         confidence = self._calculate_confidence(spec, value, unit, hint) * 0.85  # 힌트 불일치로 낮은 신뢰도
                         if variant != spec.spec_name:
                             confidence *= 0.95
+                        # chunk에서 원본 사양명 추출
+                        original_spec_name = self._extract_original_spec_name_from_chunk(
+                            chunk, spec, hint
+                        )
                         return ExtractionResult(
                             spec_item=spec,
                             value=value,
                             unit=unit or spec.expected_unit,
                             chunk=chunk,
                             method="RULE_TABLE_FALLBACK",
-                            confidence=confidence
+                            confidence=confidence,
+                            original_spec_name=original_spec_name,
+                            original_unit=unit
                         )
         
         return None
