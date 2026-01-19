@@ -7975,11 +7975,14 @@ class UnifiedLLMClient:
         Returns:
             Ollama 바이너리 경로 (없으면 None)
         """
-        # 일반적인 Ollama 설치 경로들
+        # 일반적인 Ollama 설치 경로들 (확장됨)
         possible_paths = [
             "/usr/local/bin/ollama",
             "/usr/bin/ollama",
             "/opt/ollama/bin/ollama",
+            "/workspace/ollama/bin/ollama",  # 보안망 환경
+            os.path.expanduser("~/.local/bin/ollama"),
+            os.path.join(os.path.dirname(__file__), "ollama"),  # 프로젝트 디렉토리
             "ollama"  # PATH에 있는 경우
         ]
 
@@ -7991,12 +7994,31 @@ class UnifiedLLMClient:
                     timeout=5
                 )
                 if result.returncode == 0:
-                    self.logger.info(f"Ollama 바이너리 발견: {path}")
+                    self.logger.info(f"✓ Ollama 바이너리 발견: {path}")
                     return path
-            except (subprocess.TimeoutExpired, FileNotFoundError):
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 continue
 
-        self.logger.warning("Ollama 바이너리를 찾을 수 없음")
+        # 상세한 에러 메시지
+        self.logger.error("=" * 80)
+        self.logger.error("❌ Ollama 바이너리를 찾을 수 없습니다")
+        self.logger.error("=" * 80)
+        self.logger.error("다음 경로들을 검색했습니다:")
+        for path in possible_paths:
+            self.logger.error(f"  - {path}")
+        self.logger.error("")
+        self.logger.error("Ollama 설치 방법:")
+        self.logger.error("  1. 외부 PC에서 다운로드:")
+        self.logger.error("     curl -L https://ollama.com/download/ollama-linux-amd64 -o ollama")
+        self.logger.error("     chmod +x ollama")
+        self.logger.error("")
+        self.logger.error("  2. 보안망 서버로 전송 후 설치:")
+        self.logger.error("     sudo mv ollama /usr/local/bin/")
+        self.logger.error("     sudo chmod +x /usr/local/bin/ollama")
+        self.logger.error("")
+        self.logger.error("  3. 모델 다운로드 (gemma3:27b):")
+        self.logger.error("     ollama pull gemma3:27b")
+        self.logger.error("=" * 80)
         return None
 
     def _check_ollama_server(self, port: int) -> bool:
@@ -8079,6 +8101,7 @@ class UnifiedLLMClient:
         """
         self.logger.info(f"Ollama 서버 상태 확인: {len(self.ports)}개 포트")
 
+        failed_ports = []
         for port in self.ports:
             if self._check_ollama_server(port):
                 self.logger.info(f"✓ Ollama 서버가 포트 {port}에서 이미 실행 중")
@@ -8087,6 +8110,16 @@ class UnifiedLLMClient:
                 success = self._start_ollama_server(port)
                 if not success:
                     self.logger.error(f"포트 {port}에서 Ollama 서버 시작 실패")
+                    failed_ports.append(port)
+
+        # 모든 포트에서 실패한 경우 명확한 경고
+        if failed_ports and len(failed_ports) == len(self.ports):
+            self.logger.error("=" * 80)
+            self.logger.error("❌ 모든 포트에서 Ollama 서버 시작 실패")
+            self.logger.error("=" * 80)
+            self.logger.error("LLM 기능이 작동하지 않습니다.")
+            self.logger.error("위의 설치 안내를 참고하여 Ollama를 설치해주세요.")
+            self.logger.error("=" * 80)
 
     def _cleanup_ollama_servers(self):
         """
