@@ -4507,8 +4507,60 @@ class HTMLChunkParser:
 
         return header_texts[0]
 
+    def _extract_value_from_long_text(self, text: str) -> str:
+        """
+        긴 텍스트에서 첫 번째 의미있는 값 추출 (보편적 방법)
+
+        패턴:
+        - 숫자 + 단위 (예: "100%", "50 bar", "25°C")
+        - 순수 숫자 + 단위 단어 (예: "3 SET", "5 units")
+
+        Args:
+            text: 추출할 텍스트
+
+        Returns:
+            추출된 값 (없으면 원본 텍스트의 앞부분)
+        """
+        if not text or len(text) < 200:
+            return text
+
+        # 패턴 1: 숫자 + % (가장 흔한 패턴)
+        match = re.search(r'(\d+(?:\.\d+)?)\s*%', text)
+        if match:
+            return match.group(0)
+
+        # 패턴 2: 숫자 + 단위 (bar, psi, °C, °F, etc.)
+        match = re.search(r'(\d+(?:\.\d+)?)\s*(bar|psi|°C|°F|Pa|MPa|kPa|kg|mm|cm|m|kW|MW|V|A|Hz|rpm)', text, re.IGNORECASE)
+        if match:
+            return match.group(0)
+
+        # 패턴 3: 숫자 + SET/LOT/UNIT 등
+        match = re.search(r'(\d+)\s*(SET|LOT|UNIT|UNITS|EA|PCS|PC)\b', text, re.IGNORECASE)
+        if match:
+            return match.group(0)
+
+        # 패턴 4: 범위 (예: "5 ~ 10", "20-30")
+        match = re.search(r'(\d+(?:\.\d+)?)\s*[~\-]\s*(\d+(?:\.\d+)?)', text)
+        if match:
+            return match.group(0)
+
+        # 패턴 5: 순수 숫자 (마지막 수단)
+        match = re.search(r'\b(\d+(?:\.\d+)?)\b', text)
+        if match:
+            return match.group(0)
+
+        # 추출 실패: 앞부분 200자만 반환
+        return text[:200]
+
     def _extract_vertical_kv_table(self, table) -> List[Dict]:
-        """수직 키-값 테이블 파싱 (row: key | value)"""
+        """
+        수직 키-값 테이블 파싱 (row: key | value)
+
+        개선사항 (v71):
+        - 긴 값(>200자)도 처리: 첫 번째 의미있는 값 추출
+        - 다중 컬럼 지원: Cell[i+1]이 너무 길면 Cell[i+2]도 확인
+        - 최대 값 길이: 1000자 (안전 제한)
+        """
         rows = table.find_all('tr')
         kv_pairs = []
 
@@ -4520,13 +4572,11 @@ class HTMLChunkParser:
 
             for i in range(len(cells) - 1):
                 key_raw = cells[i].get_text(strip=True)
-                value_raw = cells[i + 1].get_text(strip=True)
 
                 if not key_raw or len(key_raw) < 3 or len(key_raw) > 150:
                     continue
 
                 key = re.sub(r'\s+', ' ', key_raw)
-                value = re.sub(r'\s+', ' ', value_raw)
 
                 noise_patterns = [
                     r'^GENERAL\b', r'^TABLE\b', r'^SECTION\b', r'^PAGE\b',
@@ -4535,12 +4585,37 @@ class HTMLChunkParser:
                 if any(re.search(pat, key.upper()) for pat in noise_patterns):
                     continue
 
-                if value and len(value) < 200:
-                    kv_pairs.append({
-                        'key': key,
-                        'value': value,
-                        'row': [key, value]
-                    })
+                # 다중 컬럼 값 시도
+                values_to_try = []
+
+                # Cell[i+1] (primary value)
+                if i + 1 < len(cells):
+                    values_to_try.append(cells[i + 1].get_text(strip=True))
+
+                # Cell[i+2] (secondary value, if primary is very long)
+                if i + 2 < len(cells):
+                    primary_len = len(values_to_try[0]) if values_to_try else 0
+                    if primary_len > 500:  # Very long primary value
+                        values_to_try.append(cells[i + 2].get_text(strip=True))
+
+                # 각 값 후보에 대해 처리
+                for value_raw in values_to_try:
+                    if not value_raw or len(value_raw) > 1000:  # Safety limit
+                        continue
+
+                    value = re.sub(r'\s+', ' ', value_raw)
+
+                    # 긴 값 처리: 의미있는 부분 추출
+                    if len(value) >= 200:
+                        value = self._extract_value_from_long_text(value)
+
+                    if value:
+                        kv_pairs.append({
+                            'key': key,
+                            'value': value,
+                            'row': [key, value]
+                        })
+                        break  # 첫 번째 유효한 값을 찾았으므로 중단
 
         return kv_pairs
     
