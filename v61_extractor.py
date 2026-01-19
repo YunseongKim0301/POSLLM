@@ -7072,97 +7072,298 @@ class RuleBasedExtractor:
 
         return keywords
 
-    def _extract_hierarchical_context(self, chunk: str, match_pos: int) -> str:
+    def _extract_by_delimiters(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
         """
-        매칭 위치 주변의 계층적 구조 추출
+        전략 1: 구분자 기반 추출 (|, :, /, = 등)
 
-        예: "Working radius | Maximum | 19 m"에서 "Maximum" 매칭 시
-        → "Working radius | Maximum" 반환 (상위 컨텍스트 포함)
-
-        전략:
-        1. 매칭 위치에서 앞으로 탐색하여 상위 레벨 찾기
-        2. 구분자(|)로 계층 파악
-        3. 값이 시작되기 전까지만 포함
-
-        Args:
-            chunk: 전체 chunk 텍스트
-            match_pos: 매칭 시작 위치
-
-        Returns:
-            계층적 컨텍스트를 포함한 사양명
+        예: "Working radius | Maximum | 19 m" → "Working radius | Maximum"
         """
-        # 매칭 위치부터 앞으로 라인 시작까지 역추적
-        line_start = chunk.rfind('\n', 0, match_pos) + 1
-
-        # 매칭 위치부터 뒤로 값 종료까지 추적
-        # 숫자나 단위가 나오면 중단
-        end_pos = match_pos
-        in_spec_name = True
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+        end_pos = match_end
 
         while end_pos < len(chunk):
             char = chunk[end_pos]
 
-            # 숫자 시작 전까지만 (값 영역 제외)
             if char.isdigit():
-                # 단, | 뒤의 숫자는 값이므로 중단
-                # "Working radius | Maximum | 19" → "Maximum" 뒤 19는 값
                 break
-
-            # 줄바꿈이면 중단
             if char == '\n':
                 break
 
-            # 구분자 | 는 포함 (계층 구조)
             if char in ['|', ':', '/', '=']:
                 end_pos += 1
-                # | 뒤에 공백 건너뛰기
                 while end_pos < len(chunk) and chunk[end_pos].isspace():
                     end_pos += 1
-                # 다음 토큰 확인
+
                 next_word_end = end_pos
                 while next_word_end < len(chunk) and (chunk[next_word_end].isalnum() or chunk[next_word_end] in ['.', "'"]):
                     next_word_end += 1
 
                 next_word = chunk[end_pos:next_word_end].strip()
-                # 다음 단어가 숫자면 값이므로 중단
                 if next_word and next_word[0].isdigit():
                     break
-
-                # 알파벳이면 계층의 일부로 포함
                 if next_word and next_word[0].isalpha():
                     end_pos = next_word_end
                     continue
                 break
 
-            # 알파벳, 공백, 특수문자 계속
             if char.isalnum() or char.isspace() or char in ['.', "'", '-', '(', ')']:
                 end_pos += 1
             else:
                 break
 
-        # 라인 시작부터 종료까지 추출
         context = chunk[line_start:end_pos].strip()
 
-        # 정리: 값 부분 제거
-        # "Working radius | Maximum | 19 m" → "Working radius | Maximum"
+        # | 기반 정리
         parts = context.split('|')
         result_parts = []
-
         for part in parts:
             part = part.strip()
-            if not part:
-                continue
-
-            # 첫 글자가 숫자면 값이므로 제외
-            if part and part[0].isdigit():
+            if not part or (part and part[0].isdigit()):
                 break
-
-            # 순수 텍스트 또는 키워드면 포함
             result_parts.append(part)
 
-        result = ' | '.join(result_parts)
+        result = ' | '.join(result_parts) if result_parts else context
+        return result if result else None
 
-        return result if result else context
+    def _extract_by_word_boundaries(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """
+        전략 2: 단어 경계 기반 추출 (구분자 없어도 작동)
+
+        예: "Hoisting capacity 6 tonnes" → "Hoisting capacity"
+            "Type Electro-hydraulic" → "Type"
+        """
+        # 앞쪽 확장: 인접한 알파벳 단어들 포함
+        start = match_start
+        while start > 0:
+            prev_char = chunk[start - 1]
+            # 알파벳이나 공백이면 계속
+            if prev_char.isalpha() or (prev_char.isspace() and start > 1 and chunk[start - 2].isalpha()):
+                start -= 1
+            else:
+                break
+
+        # 뒤쪽 확장: 값 패턴 전까지
+        end = match_end
+        while end < len(chunk):
+            char = chunk[end]
+
+            # 숫자 시작하면 중단
+            if char.isdigit():
+                break
+
+            # 줄바꿈, 강한 구분자 중단
+            if char in ['\n', '\t', '|', '=']:
+                break
+
+            # 동사 패턴 감지 (is, are, should, must 등)
+            remaining = chunk[end:end+10].lower()
+            if any(remaining.startswith(v) for v in [' is ', ' are ', ' should ', ' must ', ' will ']):
+                break
+
+            # 알파벳, 공백, 일부 특수문자 계속
+            if char.isalpha() or char.isspace() or char in ['.', "'", '-', '(', ')']:
+                end += 1
+            else:
+                break
+
+        result = chunk[start:end].strip()
+
+        # 정리: 앞뒤 특수문자 제거
+        result = result.strip('.,;:')
+
+        return result if len(result) >= 2 else None
+
+    def _extract_until_value_pattern(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """
+        전략 3: 값 패턴 감지까지 추출
+
+        값 패턴:
+        - 숫자
+        - 숫자+단위 (6 tonnes, 19m, 1200kW)
+        - 특정 키워드 (not less than, approximately, about)
+        """
+        # 라인 시작부터
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+
+        # 값 패턴까지
+        end = match_end
+
+        # 단위 패턴 (일반적인 것들)
+        units = ['mm', 'cm', 'm', 'km', 'kg', 'ton', 'tonne', 'kw', 'mw', 'rpm', 'hz', 'bar',
+                 'mpa', 'kpa', 'degrees', '°c', '%', 'l/min', 'm3/h', 'm³/h', 'litre', 'liter']
+
+        while end < len(chunk):
+            char = chunk[end]
+
+            # 숫자 발견
+            if char.isdigit():
+                break
+
+            # 줄바꿈
+            if char == '\n':
+                break
+
+            # 값 관련 키워드
+            remaining = chunk[end:end+20].lower()
+            value_keywords = ['not less than', 'not more than', 'approximately',
+                             'about', 'abt.', 'min.', 'max.', 'approx']
+            if any(remaining.startswith(kw) for kw in value_keywords):
+                break
+
+            end += 1
+
+        result = chunk[line_start:end].strip()
+
+        # : / = 뒤 부분만 (있으면)
+        for delim in [':', '/', '=']:
+            if delim in result:
+                parts = result.split(delim)
+                # 마지막 부분이 비어있지 않으면
+                if len(parts) > 1 and parts[-1].strip():
+                    result = parts[-1].strip()
+                    break
+
+        return result if len(result) >= 2 else None
+
+    def _extract_by_grammar(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """
+        전략 4: 문법 기반 추출 (문장 구조 분석)
+
+        예: "The hoisting capacity is rated at 6 tonnes" → "hoisting capacity"
+            "Capacity should be 6 tonnes" → "Capacity"
+        """
+        # 문장 내에서 주어-동사 구조 찾기
+        # 매칭 키워드가 주어 부분에 있다고 가정
+
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+        line_end = chunk.find('\n', match_end)
+        if line_end == -1:
+            line_end = len(chunk)
+
+        sentence = chunk[line_start:line_end]
+
+        # 동사 패턴 찾기
+        verbs = [' is ', ' are ', ' was ', ' were ', ' should ', ' must ', ' will ', ' shall ', ' rated ']
+
+        verb_pos = -1
+        for verb in verbs:
+            pos = sentence.lower().find(verb)
+            if pos > 0:
+                verb_pos = pos
+                break
+
+        if verb_pos > 0:
+            # 동사 전까지가 주어
+            subject = sentence[:verb_pos].strip()
+
+            # 관사 제거 (The, A, An)
+            for article in ['The ', 'the ', 'A ', 'a ', 'An ', 'an ']:
+                if subject.startswith(article):
+                    subject = subject[len(article):]
+                    break
+
+            return subject if len(subject) >= 2 else None
+
+        # 동사가 없으면 단순히 : 이나 - 전
+        for delim in [':', ' - ']:
+            if delim in sentence:
+                before_delim = sentence.split(delim)[0].strip()
+                # 관사 제거
+                for article in ['The ', 'the ', 'A ', 'a ', 'An ', 'an ']:
+                    if before_delim.startswith(article):
+                        before_delim = before_delim[len(article):]
+                        break
+                return before_delim if len(before_delim) >= 2 else None
+
+        return None
+
+    def _calculate_candidate_score(self, candidate: str, spec_name: str, keyword: str) -> float:
+        """
+        후보의 품질 점수 계산
+
+        고려 요소:
+        - 길이 (너무 짧거나 길면 감점)
+        - spec_name과의 유사도
+        - keyword 포함 여부
+        - 문법적 완결성
+        """
+        score = 0.0
+
+        # 1. 길이 점수 (적절한 길이 선호)
+        length = len(candidate)
+        if 5 <= length <= 50:
+            score += 1.0
+        elif 2 <= length < 5:
+            score += 0.5
+        elif 50 < length <= 100:
+            score += 0.7
+        else:
+            score += 0.2
+
+        # 2. 키워드 포함 (대소문자 무시)
+        if keyword.lower() in candidate.lower():
+            score += 0.5
+
+        # 3. spec_name의 단어들과 유사도
+        spec_words = set(re.findall(r'\w+', spec_name.upper()))
+        cand_words = set(re.findall(r'\w+', candidate.upper()))
+
+        if spec_words and cand_words:
+            overlap = len(spec_words & cand_words)
+            similarity = overlap / len(spec_words)
+            score += similarity
+
+        # 4. 구조적 특징 (계층 구조 있으면 보너스)
+        if '|' in candidate:
+            score += 0.3
+
+        # 5. 완결성 (문장 부호로 끝나지 않으면 보너스)
+        if candidate and candidate[-1].isalnum():
+            score += 0.2
+
+        return score
+
+    def _select_best_candidate(self, candidates: List[Tuple[str, str]], spec_name: str, keyword: str) -> Optional[str]:
+        """
+        여러 후보 중 최선 선택
+
+        Args:
+            candidates: [(strategy_name, extracted_text), ...]
+            spec_name: 원본 사양명
+            keyword: 매칭된 키워드
+
+        Returns:
+            최선의 후보 문자열
+        """
+        if not candidates:
+            return None
+
+        # 검증: 길이 및 기본 조건
+        valid = []
+        for strategy, text in candidates:
+            if text and 2 <= len(text) <= 200:
+                valid.append((strategy, text))
+
+        if not valid:
+            return None
+
+        # 점수 계산
+        scored = []
+        for strategy, text in valid:
+            score = self._calculate_candidate_score(text, spec_name, keyword)
+            scored.append((score, strategy, text))
+
+        # 정렬 (점수 높은 순)
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+        # 최고 점수 반환
+        best_score, best_strategy, best_text = scored[0]
+
+        self.log.debug(
+            f"Selected candidate: '{best_text}' (strategy={best_strategy}, score={best_score:.2f})"
+        )
+
+        return best_text
 
     def _extract_original_spec_name_from_chunk(
         self,
@@ -7171,21 +7372,25 @@ class RuleBasedExtractor:
         hint: ExtractionHint = None
     ) -> str:
         """
-        Chunk 텍스트에서 원본 사양명 추출 (개선 버전)
+        Chunk 텍스트에서 원본 사양명 추출 (다중 전략 버전)
 
-        목표: POS 문서에 실제로 적혀있는 사양명을 문맥과 함께 추출
+        목표: 패턴 독립적으로 chunk에서 사양명 추출
+
+        다중 전략:
+        1. 구분자 기반 (|, :, /, =) - 계층 구조 인식
+        2. 단어 경계 기반 - 구분자 없어도 작동
+        3. 값 패턴 기반 - 숫자/단위 전까지
+        4. 문법 기반 - 동사, 접속사 전
+        5. 최소 확장 - 매칭된 키워드만
+
+        모든 전략을 시도하고 점수 기반으로 최선 선택
 
         예시:
-        1. "Hoisting capacity | SWL 6 tonnes" + spec="CAPACITY(SWL)"
-           → "Hoisting capacity" (키워드 분해로 "CAPACITY" 매칭)
-
-        2. "Working radius | Maximum | 19 m" + spec="MAX. WORKING RADIUS"
-           → "Working radius | Maximum" (계층 구조 인식)
-
-        전략:
-        1. 키워드 확장: "CAPACITY(SWL)" → ["CAPACITY", "SWL"]
-        2. 계층적 문맥 추출: 상위-하위 관계 인식
-        3. 원본 표기 보존: 대소문자, 특수문자 유지
+        - "Hoisting capacity | SWL 6 tonnes" → "Hoisting capacity"
+        - "Working radius | Maximum | 19 m" → "Working radius | Maximum"
+        - "Type Electro-hydraulic" → "Type"
+        - "The hoisting capacity is rated at 6 tonnes" → "hoisting capacity"
+        - "Capacity 6 tonnes" → "Capacity"
 
         Args:
             chunk: POS 문서 chunk 텍스트
@@ -7193,15 +7398,14 @@ class RuleBasedExtractor:
             hint: 추출 힌트
 
         Returns:
-            원본 사양명 (문맥 포함) 또는 빈 문자열
+            원본 사양명 또는 빈 문자열
         """
         if not chunk:
             return ""
 
-        # 1단계: 기본 변형 목록
+        # 1단계: 검색 키워드 생성
         variants = self._get_spec_name_variants(spec.spec_name, hint)
 
-        # 2단계: 키워드 확장 (각 변형마다)
         expanded_keywords = []
         for variant in variants:
             keywords = self._expand_spec_keywords(variant)
@@ -7209,40 +7413,67 @@ class RuleBasedExtractor:
                 if kw and kw not in expanded_keywords:
                     expanded_keywords.append(kw)
 
-        # 검색 우선순위: 원본 변형 → 확장 키워드
+        # 우선순위: 원본 변형 → 확장 키워드
         search_terms = variants + [kw for kw in expanded_keywords if kw not in variants]
 
-        best_match = None
-        best_match_length = 0
+        # 2단계: 모든 후보 수집
+        all_candidates = []
 
-        # 각 검색어로 시도
-        for search_term in search_terms:
-            # 대소문자 구분 없이 검색
-            pattern = re.compile(re.escape(search_term), re.IGNORECASE)
+        for keyword in search_terms:
+            # 대소문자 무시 검색
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
             match = pattern.search(chunk)
 
-            if match:
-                # 계층적 컨텍스트 추출
-                context = self._extract_hierarchical_context(chunk, match.start())
+            if not match:
+                continue
 
-                # 정리: 앞뒤 공백, 줄바꿈 제거
-                context = context.strip()
+            match_start = match.start()
+            match_end = match.end()
 
-                # 최소 길이 검증 (너무 짧으면 무시)
-                if len(context) < 2:
-                    continue
+            # 전략 1: 구분자 기반
+            c1 = self._extract_by_delimiters(chunk, match_start, match_end, keyword)
+            if c1:
+                all_candidates.append(("delimiter", c1))
 
-                # 더 긴 매칭 우선 (더 구체적)
-                if len(context) > best_match_length:
-                    best_match = context
-                    best_match_length = len(context)
+            # 전략 2: 단어 경계 기반
+            c2 = self._extract_by_word_boundaries(chunk, match_start, match_end, keyword)
+            if c2:
+                all_candidates.append(("word_boundary", c2))
 
-                    self.log.debug(
-                        f"Found spec name: '{context}' "
-                        f"(keyword: '{search_term}', spec: '{spec.spec_name}')"
-                    )
+            # 전략 3: 값 패턴 기반
+            c3 = self._extract_until_value_pattern(chunk, match_start, match_end, keyword)
+            if c3:
+                all_candidates.append(("value_pattern", c3))
 
-        return best_match if best_match else ""
+            # 전략 4: 문법 기반
+            c4 = self._extract_by_grammar(chunk, match_start, match_end, keyword)
+            if c4:
+                all_candidates.append(("grammar", c4))
+
+            # 전략 5: 최소 확장 (매칭된 키워드만)
+            minimal = chunk[match_start:match_end]
+            if minimal:
+                all_candidates.append(("minimal", minimal))
+
+        # 3단계: 중복 제거 (동일한 텍스트는 한 번만)
+        unique_candidates = []
+        seen_texts = set()
+        for strategy, text in all_candidates:
+            text_normalized = text.strip().upper()
+            if text_normalized not in seen_texts:
+                seen_texts.add(text_normalized)
+                unique_candidates.append((strategy, text))
+
+        # 4단계: 최선의 후보 선택
+        if not unique_candidates:
+            return ""
+
+        # 가장 많이 사용된 키워드로 선택 (여러 전략에서 나온 것)
+        best_keyword = search_terms[0] if search_terms else spec.spec_name
+
+        best = self._select_best_candidate(unique_candidates, spec.spec_name, best_keyword)
+
+        return best if best else ""
 
     def extract(
         self,
@@ -8563,12 +8794,8 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             return None
     
     def _expand_spec_keywords(self, spec_name: str) -> List[str]:
-        """
-        사양명을 키워드로 분해하여 검색 범위 확장
-        (RuleBasedExtractor와 동일한 로직)
-        """
+        """사양명을 키워드로 분해 (RuleBasedExtractor와 동일)"""
         keywords = [spec_name]
-
         if '(' in spec_name:
             base = spec_name.split('(')[0].strip()
             if base and base not in keywords:
@@ -8578,7 +8805,6 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
                 paren_content = paren_match.group(1).strip()
                 if paren_content and paren_content not in keywords:
                     keywords.append(paren_content)
-
         if '.' in spec_name:
             expanded = spec_name.replace('MAX.', 'MAXIMUM').replace('MIN.', 'MINIMUM')
             if expanded != spec_name and expanded not in keywords:
@@ -8586,34 +8812,25 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             no_dot = spec_name.replace('.', '').strip()
             if no_dot and no_dot not in keywords:
                 keywords.append(no_dot)
-
         words = re.findall(r'[A-Z][A-Z]+', spec_name)
         for word in words:
             if len(word) >= 3 and word not in keywords:
                 keywords.append(word)
-
         if ' ' in spec_name:
             parts = spec_name.split()
             if len(parts) >= 2:
                 last_two = ' '.join(parts[-2:])
                 if last_two not in keywords:
                     keywords.append(last_two)
-
         return keywords
 
-    def _extract_hierarchical_context(self, chunk: str, match_pos: int) -> str:
-        """
-        매칭 위치 주변의 계층적 구조 추출
-        (RuleBasedExtractor와 동일한 로직)
-        """
-        line_start = chunk.rfind('\n', 0, match_pos) + 1
-        end_pos = match_pos
-
+    def _extract_by_delimiters(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """전략 1: 구분자 기반 (RuleBasedExtractor와 동일)"""
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+        end_pos = match_end
         while end_pos < len(chunk):
             char = chunk[end_pos]
-            if char.isdigit():
-                break
-            if char == '\n':
+            if char.isdigit() or char == '\n':
                 break
             if char in ['|', ':', '/', '=']:
                 end_pos += 1
@@ -8633,61 +8850,195 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
                 end_pos += 1
             else:
                 break
-
         context = chunk[line_start:end_pos].strip()
         parts = context.split('|')
         result_parts = []
-
         for part in parts:
             part = part.strip()
-            if not part:
-                continue
-            if part and part[0].isdigit():
+            if not part or (part and part[0].isdigit()):
                 break
             result_parts.append(part)
+        result = ' | '.join(result_parts) if result_parts else context
+        return result if result else None
 
-        result = ' | '.join(result_parts)
-        return result if result else context
+    def _extract_by_word_boundaries(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """전략 2: 단어 경계 기반 (RuleBasedExtractor와 동일)"""
+        start = match_start
+        while start > 0:
+            prev_char = chunk[start - 1]
+            if prev_char.isalpha() or (prev_char.isspace() and start > 1 and chunk[start - 2].isalpha()):
+                start -= 1
+            else:
+                break
+        end = match_end
+        while end < len(chunk):
+            char = chunk[end]
+            if char.isdigit() or char in ['\n', '\t', '|', '=']:
+                break
+            remaining = chunk[end:end+10].lower()
+            if any(remaining.startswith(v) for v in [' is ', ' are ', ' should ', ' must ', ' will ']):
+                break
+            if char.isalpha() or char.isspace() or char in ['.', "'", '-', '(', ')']:
+                end += 1
+            else:
+                break
+        result = chunk[start:end].strip().strip('.,;:')
+        return result if len(result) >= 2 else None
+
+    def _extract_until_value_pattern(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """전략 3: 값 패턴 감지 (RuleBasedExtractor와 동일)"""
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+        end = match_end
+        while end < len(chunk):
+            char = chunk[end]
+            if char.isdigit() or char == '\n':
+                break
+            remaining = chunk[end:end+20].lower()
+            value_keywords = ['not less than', 'not more than', 'approximately', 'about', 'abt.', 'min.', 'max.', 'approx']
+            if any(remaining.startswith(kw) for kw in value_keywords):
+                break
+            end += 1
+        result = chunk[line_start:end].strip()
+        for delim in [':', '/', '=']:
+            if delim in result:
+                parts = result.split(delim)
+                if len(parts) > 1 and parts[-1].strip():
+                    result = parts[-1].strip()
+                    break
+        return result if len(result) >= 2 else None
+
+    def _extract_by_grammar(self, chunk: str, match_start: int, match_end: int, keyword: str) -> Optional[str]:
+        """전략 4: 문법 기반 (RuleBasedExtractor와 동일)"""
+        line_start = chunk.rfind('\n', 0, match_start) + 1
+        line_end = chunk.find('\n', match_end)
+        if line_end == -1:
+            line_end = len(chunk)
+        sentence = chunk[line_start:line_end]
+        verbs = [' is ', ' are ', ' was ', ' were ', ' should ', ' must ', ' will ', ' shall ', ' rated ']
+        verb_pos = -1
+        for verb in verbs:
+            pos = sentence.lower().find(verb)
+            if pos > 0:
+                verb_pos = pos
+                break
+        if verb_pos > 0:
+            subject = sentence[:verb_pos].strip()
+            for article in ['The ', 'the ', 'A ', 'a ', 'An ', 'an ']:
+                if subject.startswith(article):
+                    subject = subject[len(article):]
+                    break
+            return subject if len(subject) >= 2 else None
+        for delim in [':', ' - ']:
+            if delim in sentence:
+                before_delim = sentence.split(delim)[0].strip()
+                for article in ['The ', 'the ', 'A ', 'a ', 'An ', 'an ']:
+                    if before_delim.startswith(article):
+                        before_delim = before_delim[len(article):]
+                        break
+                return before_delim if len(before_delim) >= 2 else None
+        return None
+
+    def _calculate_candidate_score(self, candidate: str, spec_name: str, keyword: str) -> float:
+        """후보 점수 계산 (RuleBasedExtractor와 동일)"""
+        score = 0.0
+        length = len(candidate)
+        if 5 <= length <= 50:
+            score += 1.0
+        elif 2 <= length < 5:
+            score += 0.5
+        elif 50 < length <= 100:
+            score += 0.7
+        else:
+            score += 0.2
+        if keyword.lower() in candidate.lower():
+            score += 0.5
+        spec_words = set(re.findall(r'\w+', spec_name.upper()))
+        cand_words = set(re.findall(r'\w+', candidate.upper()))
+        if spec_words and cand_words:
+            overlap = len(spec_words & cand_words)
+            similarity = overlap / len(spec_words)
+            score += similarity
+        if '|' in candidate:
+            score += 0.3
+        if candidate and candidate[-1].isalnum():
+            score += 0.2
+        return score
+
+    def _select_best_candidate(self, candidates: List[Tuple[str, str]], spec_name: str, keyword: str) -> Optional[str]:
+        """최선 후보 선택 (RuleBasedExtractor와 동일)"""
+        if not candidates:
+            return None
+        valid = [(s, t) for s, t in candidates if t and 2 <= len(t) <= 200]
+        if not valid:
+            return None
+        scored = [(self._calculate_candidate_score(t, spec_name, keyword), s, t) for s, t in valid]
+        scored.sort(reverse=True, key=lambda x: x[0])
+        return scored[0][2]
 
     def _improve_original_spec_name(self, chunk: str, spec: SpecItem, llm_suggested: str) -> str:
         """
-        LLM이 제안한 original_spec_name을 chunk에서 개선
+        LLM 제안을 다중 전략으로 개선 (완전 재작성)
 
-        Args:
-            chunk: POS 문서 chunk
-            spec: 사양 항목
-            llm_suggested: LLM이 제안한 사양명
-
-        Returns:
-            개선된 사양명 (계층적 맥락 포함)
+        LLM이 제안한 사양명을 기반으로 chunk에서 더 나은 매칭 시도
         """
         if not chunk or not spec.spec_name:
             return llm_suggested
 
-        # 키워드 확장
+        # 검색 키워드 생성
         keywords = self._expand_spec_keywords(spec.spec_name)
-
-        # LLM 제안도 키워드에 추가
         if llm_suggested and llm_suggested not in keywords:
-            keywords.insert(0, llm_suggested)  # 우선순위 높임
+            keywords.insert(0, llm_suggested)  # LLM 제안 우선
 
-        best_match = None
-        best_match_length = 0
+        # 모든 후보 수집
+        all_candidates = []
 
         for keyword in keywords:
             pattern = re.compile(re.escape(keyword), re.IGNORECASE)
             match = pattern.search(chunk)
+            if not match:
+                continue
 
-            if match:
-                context = self._extract_hierarchical_context(chunk, match.start())
-                context = context.strip()
+            match_start = match.start()
+            match_end = match.end()
 
-                if len(context) >= 2 and len(context) > best_match_length:
-                    best_match = context
-                    best_match_length = len(context)
+            # 5가지 전략 모두 시도
+            c1 = self._extract_by_delimiters(chunk, match_start, match_end, keyword)
+            if c1:
+                all_candidates.append(("delimiter", c1))
 
-        # 개선된 매칭이 없으면 LLM 제안 사용
-        return best_match if best_match else llm_suggested
+            c2 = self._extract_by_word_boundaries(chunk, match_start, match_end, keyword)
+            if c2:
+                all_candidates.append(("word_boundary", c2))
+
+            c3 = self._extract_until_value_pattern(chunk, match_start, match_end, keyword)
+            if c3:
+                all_candidates.append(("value_pattern", c3))
+
+            c4 = self._extract_by_grammar(chunk, match_start, match_end, keyword)
+            if c4:
+                all_candidates.append(("grammar", c4))
+
+            minimal = chunk[match_start:match_end]
+            if minimal:
+                all_candidates.append(("minimal", minimal))
+
+        # 중복 제거
+        unique_candidates = []
+        seen_texts = set()
+        for strategy, text in all_candidates:
+            text_normalized = text.strip().upper()
+            if text_normalized not in seen_texts:
+                seen_texts.add(text_normalized)
+                unique_candidates.append((strategy, text))
+
+        # 최선 선택
+        if unique_candidates:
+            best = self._select_best_candidate(unique_candidates, spec.spec_name, keywords[0])
+            if best:
+                return best
+
+        # 개선 실패시 LLM 제안 사용
+        return llm_suggested
 
     def _parse_llm_response(
         self,
