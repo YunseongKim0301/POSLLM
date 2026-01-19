@@ -8991,9 +8991,11 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
 
     def _improve_original_spec_name(self, chunk: str, spec: SpecItem, llm_suggested: str) -> str:
         """
-        LLM 제안을 다중 전략으로 개선 (완전 재작성)
+        LLM 제안을 다중 전략으로 개선
 
         LLM이 제안한 사양명을 기반으로 chunk에서 더 나은 매칭 시도
+
+        Issue 3 Fix: 범용적인 추출 방법 추가 (특정 패턴에만 의존하지 않음)
         """
         if not chunk or not spec.spec_name:
             return llm_suggested
@@ -9015,7 +9017,7 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             match_start = match.start()
             match_end = match.end()
 
-            # 5가지 전략 모두 시도
+            # 기존 5가지 전략
             c1 = self._extract_by_delimiters(chunk, match_start, match_end, keyword)
             if c1:
                 all_candidates.append(("delimiter", c1))
@@ -9035,6 +9037,36 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             minimal = chunk[match_start:match_end]
             if minimal:
                 all_candidates.append(("minimal", minimal))
+
+        # ===== Issue 3 Fix: 범용적인 전략 추가 =====
+        # 전략 6: 문맥 기반 추출 (구분자가 없어도 작동)
+        # spec_name 키워드가 포함된 라인 전체를 후보로 추가
+        for line in chunk.split('\n'):
+            line_stripped = line.strip()
+            if not line_stripped or len(line_stripped) > 200:
+                continue
+
+            # spec_name의 주요 키워드가 2개 이상 포함된 라인
+            spec_words = [w.upper() for w in spec.spec_name.split() if len(w) >= 3]
+            line_upper = line_stripped.upper()
+            matched_count = sum(1 for w in spec_words if w in line_upper)
+
+            if matched_count >= 2:
+                # 숫자로 시작하지 않고, 적절한 길이의 텍스트
+                if not line_stripped[0].isdigit() and 5 <= len(line_stripped) <= 150:
+                    # 구분자가 있으면 앞부분만 추출
+                    for delim in [':', '|', '/', '=']:
+                        if delim in line_stripped:
+                            candidate = line_stripped.split(delim)[0].strip()
+                            if 3 <= len(candidate) <= 150:
+                                all_candidates.append(("context_line", candidate))
+                            break
+                    else:
+                        # 구분자가 없으면 라인 전체 (값 부분 제외)
+                        # 숫자가 많으면 제외 (값이 포함된 것으로 간주)
+                        digit_count = sum(1 for c in line_stripped if c.isdigit())
+                        if digit_count < len(line_stripped) * 0.3:
+                            all_candidates.append(("context_line", line_stripped))
 
         # 중복 제거
         unique_candidates = []
@@ -9765,22 +9797,159 @@ class POSExtractorV61:
         if match:
             return match.group(1)
         return ""
-    
+
+    def _extract_spec_name_from_chunk(
+        self,
+        chunk: str,
+        extracted_value: str,
+        spec_name: str,
+        hint: ExtractionHint = None
+    ) -> str:
+        """
+        Chunk에서 사양명 추출 (LLM이 실패했을 때 fallback)
+
+        문제: LLM이 original_spec_name을 추출하지 못하면 spec.spec_name이 그대로 pos_umgv_desc에 들어감
+        해결: chunk에서 직접 추출 시도
+
+        전략:
+        1. 값 주변의 텍스트에서 사양명 찾기
+        2. 힌트의 pos_umgv_desc 활용
+        3. 구분자 패턴 (: | / =) 활용
+        4. 문장 구조 분석
+        5. 범용적인 키워드 매칭 (특정 패턴에 의존하지 않음)
+        """
+        if not chunk:
+            return ""
+
+        candidates = []
+
+        # 전략 1: 힌트의 pos_umgv_desc가 chunk에 있으면 사용
+        if hint and hint.pos_umgv_desc:
+            pos_desc_upper = hint.pos_umgv_desc.upper()
+            chunk_upper = chunk.upper()
+            if pos_desc_upper in chunk_upper:
+                candidates.append(('hint', hint.pos_umgv_desc, 1.0))
+
+        # 전략 2: 값 주변 텍스트 분석
+        if extracted_value:
+            # 값이 있는 위치 찾기
+            value_pos = chunk.upper().find(extracted_value.upper())
+            if value_pos > 0:
+                # 값 앞의 텍스트 (최대 200자)
+                before_value = chunk[max(0, value_pos - 200):value_pos]
+
+                # 구분자로 분리 (: | / =)
+                for delimiter in [':', '|', '/', '=']:
+                    if delimiter in before_value:
+                        parts = before_value.split(delimiter)
+                        if len(parts) >= 2:
+                            # 구분자 직전 부분
+                            spec_candidate = parts[-1].strip()
+                            # 너무 짧거나 길면 제외
+                            if 3 <= len(spec_candidate) <= 150:
+                                # 숫자로 시작하지 않으면 후보로 추가
+                                if not spec_candidate[0].isdigit():
+                                    candidates.append(('delimiter', spec_candidate, 0.8))
+
+        # 전략 3: spec_name 키워드가 chunk에 있는지 확인
+        spec_keywords = spec_name.upper().split()
+        for line in chunk.split('\n'):
+            line_upper = line.upper()
+            # 2개 이상의 키워드가 포함된 라인
+            matched_keywords = sum(1 for kw in spec_keywords if kw in line_upper)
+            if matched_keywords >= 2:
+                # 라인에서 구분자 앞 부분 추출
+                for delimiter in [':', '|', '/']:
+                    if delimiter in line:
+                        before_delim = line.split(delimiter)[0].strip()
+                        if 3 <= len(before_delim) <= 150 and not before_delim[0].isdigit():
+                            score = 0.6 + (matched_keywords * 0.1)
+                            candidates.append(('keyword_match', before_delim, score))
+                        break
+
+        # 전략 4: 범용적인 패턴 - 숫자 앞의 텍스트
+        # 예: "Capacity 700 m3/h" → "Capacity"
+        number_pattern = r'([A-Za-z\s\(\)/\-]{3,100})\s+(\d+\.?\d*)'
+        matches = re.finditer(number_pattern, chunk)
+        for match in matches:
+            potential_spec = match.group(1).strip()
+            # 뒤의 숫자가 extracted_value와 일치하면 높은 점수
+            number = match.group(2)
+            if number in extracted_value:
+                candidates.append(('number_context', potential_spec, 0.7))
+
+        # 후보가 없으면 빈 문자열 반환 (spec.spec_name을 넣지 않음)
+        if not candidates:
+            return ""
+
+        # 점수가 가장 높은 후보 선택
+        candidates.sort(key=lambda x: -x[2])
+        best_candidate = candidates[0][1]
+
+        # 추가 검증: spec_name과 너무 유사하면 제외 (단순 복사 방지)
+        if best_candidate.upper() == spec_name.upper():
+            # 두 번째 후보 확인
+            if len(candidates) > 1:
+                return candidates[1][1]
+            else:
+                return ""  # spec_name과 같으면 빈 문자열
+
+        return best_candidate
+
     def _create_result(
-        self, 
-        result: ExtractionResult, 
+        self,
+        result: ExtractionResult,
         spec: SpecItem,
         html_path: str = "",
         hint: ExtractionHint = None
     ) -> Dict[str, Any]:
         """결과 딕셔너리 생성 (힌트 정보 포함)"""
         raw = spec.raw_data or {}
-        
+
         # 힌트에서 section_num 가져오기
         section_num = ""
         if hint and hint.section_num:
             section_num = hint.section_num[:100]  # 최대 100자
-        
+
+        # ===== Issue 1 Fix: pos_umgv_desc 개선 =====
+        # LLM이 original_spec_name을 추출하지 못했거나 spec.spec_name과 동일한 경우,
+        # chunk에서 직접 추출 시도
+        pos_umgv_desc = result.original_spec_name or ""
+        if not pos_umgv_desc or pos_umgv_desc == spec.spec_name:
+            # chunk에서 재추출 시도
+            extracted_from_chunk = self._extract_spec_name_from_chunk(
+                chunk=result.chunk or "",
+                extracted_value=result.value,
+                spec_name=spec.spec_name,
+                hint=hint
+            )
+            if extracted_from_chunk and extracted_from_chunk != spec.spec_name:
+                pos_umgv_desc = extracted_from_chunk
+            # 재추출에도 실패하면 빈 문자열 (spec.spec_name을 넣지 않음)
+
+        # ===== Issue 2 Fix: pos_chunk 개선 =====
+        # 500자 → 1500자로 확대, 문장 단위로 자르기 (맥락 보존)
+        pos_chunk = ""
+        if result.chunk:
+            max_chars = 1500
+            if len(result.chunk) <= max_chars:
+                pos_chunk = result.chunk
+            else:
+                # 1500자에서 가장 가까운 문장 끝(.!?) 찾기
+                truncated = result.chunk[:max_chars]
+                # 마지막 문장 끝 찾기
+                last_period = max(
+                    truncated.rfind('.'),
+                    truncated.rfind('!'),
+                    truncated.rfind('?'),
+                    truncated.rfind('\n')
+                )
+                if last_period > max_chars * 0.7:  # 70% 이상이면 사용
+                    pos_chunk = result.chunk[:last_period + 1]
+                else:
+                    # 문장 끝을 찾지 못하면 그냥 자르기
+                    pos_chunk = truncated + "..."
+
         return {
             'pmg_desc': safe_get(raw, 'pmg_desc'),
             'pmg_code': safe_get(raw, 'pmg_code'),
@@ -9796,10 +9965,10 @@ class POSExtractorV61:
             'table_text': 'Y' if result.chunk else '',
             'value_format': self._detect_format(result.value),
             'umgv_uom': spec.expected_unit,
-            'pos_chunk': result.chunk[:500] if result.chunk else '',
+            'pos_chunk': pos_chunk,
             # POS 원문 텍스트 보존 (대소문자, 특수문자 등 그대로)
             'pos_mat_attr_desc': result.original_equipment or spec.equipment,
-            'pos_umgv_desc': result.original_spec_name or spec.spec_name,
+            'pos_umgv_desc': pos_umgv_desc,  # 개선된 로직 적용
             'pos_umgv_value': result.value,
             'umgv_value_edit': '',  # Always empty - user feedback before validation
             'pos_umgv_uom': result.original_unit or result.unit,
