@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-POS Specification Value Extractor v61 (PostgreSQL-Enhanced)
-============================================================
+POS Specification Value Extractor (PostgreSQL-Enhanced)
+========================================================
 
 PostgreSQL 기반 동적 지식 통합 및 성능 최적화
 
-주요 개선사항 (v61):
-1. PostgreSQL 전용 모드 (파일 기반 제거)
+주요 기능:
+1. PostgreSQL 전용 모드
 2. 동적 지식 베이스 (pos_dict, umgv_fin 활용)
 3. In-memory 캐싱으로 보안 네트워크 대응
 4. Enhanced chunk selection (7-stage)
 5. LLM 후처리 (범위 파싱, 단위 정규화)
-6. 병렬 처리 최적화 (300K specs in 9.9 hours)
+6. 병렬 처리 최적화
 7. 출력 형식 개선 (nested JSON, 디버그 CSV)
 
 추출 모드:
-- FULL: Template의 모든 POS 추출 (기존 방식)
+- FULL: Template의 모든 POS 추출
 - LIGHT: POS 폴더 파일 기준, 해당 row만 추출 (빠른 초기화)
 """
 
@@ -258,7 +258,7 @@ USER_ENABLE_LLM_SIMILARITY_VALIDATION = False
 USER_SEMANTIC_CACHE_DIR = "/workspace/cache/embeddings"
 
 # =============================================================================
-# 값 검증 설정 (v2에서 추가)
+# 값 검증 설정
 # =============================================================================
 ENABLE_VALUE_VALIDATION = True
 # NUMERIC_VARIANCE_THRESHOLD 제거: 실제 사양값은 과거 값과 전혀 다를 수 있으므로
@@ -267,7 +267,7 @@ MIN_VALUE_LENGTH = 1
 MAX_VALUE_LENGTH = 200
 
 # =============================================================================
-# 복합값/범위값 파싱 설정 (v2에서 추가)
+# 복합값/범위값 파싱 설정
 # =============================================================================
 SPLIT_COMPOUND_VALUES = True  # 슬래시(/) 구분 복합값 분리 여부
 SPLIT_RANGE_VALUES = True     # 범위(~, -) 값 분리 여부
@@ -281,11 +281,11 @@ logging.basicConfig(
     format='[%(levelname)s] %(asctime)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("POSExtractorV61")
+logger = logging.getLogger("POSExtractor")
 
 
 # ############################################################################
-# 체크박스 패턴 (하드코딩 허용 - 표준화된 UI 패턴) (v2에서 추가)
+# 체크박스 패턴 (하드코딩 허용 - 표준화된 UI 패턴)
 # ############################################################################
 
 CHECKBOX_PATTERNS = {
@@ -300,7 +300,7 @@ CHECKBOX_PATTERNS = {
 
 
 # =============================================================================
-# 출력 스키마 정의 (v51.1 기준)
+# 출력 스키마 정의
 # =============================================================================
 
 # 새 출력 스키마 (사용자 요청 기준)
@@ -472,7 +472,7 @@ def safe_get(data: Dict, key: str, default: str = "") -> str:
 
 
 def safe_float(val: Any, default: float = 0.0) -> float:
-    """안전한 float 변환 (v2에서 추가)"""
+    """안전한 float 변환"""
     try:
         if val is None:
             return default
@@ -484,7 +484,7 @@ def safe_float(val: Any, default: float = 0.0) -> float:
 
 
 def extract_numeric_value(text: str) -> Optional[float]:
-    """텍스트에서 숫자값 추출 (v2에서 추가)"""
+    """텍스트에서 숫자값 추출"""
     if not text:
         return None
     # 숫자와 소수점, 쉼표만 추출
@@ -545,7 +545,7 @@ def is_numeric_spec(spec_name: str, value_format: str = "", confidence_level: bo
 
 
 def detect_checkbox_selection(text: str) -> Optional[str]:
-    """체크박스 선택 상태 감지 (v2에서 추가)"""
+    """체크박스 선택 상태 감지"""
     if not text:
         return None
 
@@ -571,7 +571,7 @@ def detect_checkbox_selection(text: str) -> Optional[str]:
 
 
 def parse_compound_value(raw_value: str, split_enabled: bool = True) -> List[Tuple[str, str]]:
-    """복합값 파싱 - 슬래시 구분 (v2에서 추가)"""
+    """복합값 파싱 - 슬래시 구분"""
     if not raw_value or not raw_value.strip():
         return []
 
@@ -620,7 +620,7 @@ def parse_compound_value(raw_value: str, split_enabled: bool = True) -> List[Tup
 
 
 def parse_range_value(raw_value: str, split_enabled: bool = True) -> List[Tuple[str, str]]:
-    """범위형 값 파싱 (v2에서 추가)"""
+    """범위형 값 파싱"""
     if not raw_value or not raw_value.strip():
         return []
 
@@ -1058,13 +1058,13 @@ class Config:
     light_mode_skip_hybrid_match: bool = True
     light_mode_workers: int = 4  # 병렬 worker 수 (3-6 권장)
 
-    # 값 검증 설정 (v2에서 추가)
+    # 값 검증 설정
     enable_value_validation: bool = True
     # numeric_variance_threshold 제거 - 과거 값 대비 variance check는 부적절
     min_value_length: int = 1
     max_value_length: int = 200
 
-    # 복합값/범위값 파싱 (v2에서 추가)
+    # 복합값/범위값 파싱
     split_compound_values: bool = True
     split_range_values: bool = True
 
@@ -1163,13 +1163,13 @@ def build_config() -> Config:
         light_mode_skip_hybrid_match=LIGHT_MODE_SKIP_HYBRID_MATCH,
         light_mode_workers=LIGHT_MODE_WORKERS,
 
-        # 값 검증 설정 (v2에서 추가)
+        # 값 검증 설정
         enable_value_validation=ENABLE_VALUE_VALIDATION,
         # numeric_variance_threshold 제거
         min_value_length=MIN_VALUE_LENGTH,
         max_value_length=MAX_VALUE_LENGTH,
 
-        # 복합값/범위값 파싱 (v2에서 추가)
+        # 복합값/범위값 파싱
         split_compound_values=SPLIT_COMPOUND_VALUES,
         split_range_values=SPLIT_RANGE_VALUES,
     )
@@ -1228,7 +1228,7 @@ class ExtractionResult:
 
 
 # ############################################################################
-# 동의어 관리자 (DB 기반 - 하드코딩 제거) (v2에서 추가)
+# 동의어 관리자 (DB 기반 - 하드코딩 제거)
 # ############################################################################
 
 class SynonymManager:
@@ -1365,7 +1365,7 @@ class SynonymManager:
 
 
 # ############################################################################
-# 값 검증기 (Phase 4) (v2에서 추가)
+# 값 검증기 (Phase 4)
 # ############################################################################
 
 class ValueValidator:
@@ -4158,7 +4158,7 @@ class HTMLChunkParser:
         return html_content
 
     def _extract_tables(self):
-        """테이블 추출 (v2 개선: 구조 정보 포함)"""
+        """테이블 추출"""
         if not self.soup:
             return
 
@@ -4189,11 +4189,11 @@ class HTMLChunkParser:
                 if cells and any(c for c in cells):  # 비어있지 않은 행만
                     table_data.append(cells)
 
-                    # 헤더 행 감지 (v2: 개선된 로직)
+                    # 헤더 행 감지
                     has_th = row.find('th') is not None
                     if has_th or (row_idx == 0 and structure['header_row_idx'] == -1):
                         # 헤더 행인지 추가 검증
-                        if self._is_likely_header_row_v2(cells):
+                        if self._is_likely_header_row(cells):
                             structure['header_row_idx'] = len(table_data) - 1  # table_data 인덱스 사용
                             structure['header_cols'] = cells
                             structure['data_start_row'] = len(table_data)  # 다음 행부터 데이터
@@ -4206,7 +4206,7 @@ class HTMLChunkParser:
     
     def _extract_kv_pairs(self):
         """
-        테이블에서 키-값 쌍 추출 (v3: 고급 파싱 통합)
+        테이블에서 키-값 쌍 추출
 
         개선사항:
         1. 수평 데이터 테이블 지원 (row=item, column=attribute)
@@ -4282,7 +4282,7 @@ class HTMLChunkParser:
                     self.kv_index[parsed['spec']] = kv
 
     def _aggressive_normalize(self, text: str) -> str:
-        """강화된 정규화 (v61_standalone_test.py 이식)"""
+        """강화된 정규화"""
         if not text:
             return ""
         text = re.sub(r'\s+', '', text)
@@ -4347,8 +4347,8 @@ class HTMLChunkParser:
         # 어떤 패턴도 찾지 못함 - 변환이 발생했을 가능성
         return False
 
-    def _detect_header_row_v3(self, row_cells: List[str]) -> bool:
-        """헤더 행 감지 (v3)"""
+    def _detect_header_row(self, row_cells: List[str]) -> bool:
+        """헤더 행 감지"""
         if not row_cells:
             return False
 
@@ -4385,7 +4385,7 @@ class HTMLChunkParser:
 
         for i, row in enumerate(rows[:5]):
             cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
-            if self._detect_header_row_v3(cells):
+            if self._detect_header_row(cells):
                 header_row_objects.append(row)
                 header_texts.append(cells)
                 data_start_idx = i + 1
@@ -4556,7 +4556,7 @@ class HTMLChunkParser:
         """
         수직 키-값 테이블 파싱 (row: key | value)
 
-        개선사항 (v71):
+        개선사항:
         - 긴 값(>200자)도 처리: 첫 번째 의미있는 값 추출
         - 다중 컬럼 지원: Cell[i+1]이 너무 길면 Cell[i+2]도 확인
         - 최대 값 길이: 1000자 (안전 제한)
@@ -4782,9 +4782,9 @@ class HTMLChunkParser:
 
         return result
 
-    def _is_likely_header_row_v2(self, cells: List[str]) -> bool:
+    def _is_likely_header_row(self, cells: List[str]) -> bool:
         """
-        헤더 행인지 판단 (v2 개선: 키워드 카운트 기반)
+        헤더 행인지 판단
 
         개선사항:
         - 헤더 키워드 수 카운트
@@ -4794,7 +4794,7 @@ class HTMLChunkParser:
         if not cells:
             return False
 
-        # 헤더 키워드 (v2)
+        # 헤더 키워드
         header_keywords = [
             'type', 'item', 'description', 'spec', 'specification', 'parameter',
             'unit', 'value', 'qty', "q'ty", 'quantity', 'remark', 'no.', 'no',
@@ -4992,7 +4992,7 @@ class HTMLChunkParser:
 
     def search_in_tables_enhanced(self, keywords: List[str]) -> List[Dict]:
         """
-        테이블 검색 (v2 개선: 위치 기반 값 추출)
+        테이블 검색
 
         개선사항:
         - 헤더/데이터 구분
@@ -7888,14 +7888,14 @@ class RuleBasedExtractor:
 
 
 # =============================================================================
-# UnifiedLLMClient (v2에서 추가 - Ollama 전용)
+# UnifiedLLMClient
 # =============================================================================
 
 class UnifiedLLMClient:
     """
     Ollama LLM 클라이언트 (포트 로테이션 지원)
 
-    개선사항 (v2):
+    개선사항:
     - 포트 로테이션으로 부하 분산
     - 스레드 안전 포트 선택
     - 토큰 추적
@@ -8233,7 +8233,7 @@ class LLMFallbackExtractor:
 
         # 동적 지식 컴포넌트 (PostgreSQL 기반)
         self.use_dynamic_knowledge = use_dynamic_knowledge
-        self.pg_knowledge_loader = None  # POSExtractorV52에서 주입
+        self.pg_knowledge_loader = None  # POSExtractor에서 주입
         self.unit_normalizer = None
     
     def _init_enhanced_components(self, parser: HTMLChunkParser):
@@ -8333,8 +8333,13 @@ class LLMFallbackExtractor:
         if not chunk:
             chunk = self._get_relevant_chunk(parser, spec, max_chunk_chars, hint)
 
+        # 최종 fallback: 전체 텍스트 사용 (약어나 다른 이유로 chunk를 찾지 못한 경우)
         if not chunk:
-            self.log.debug("LLM Fallback 스킵: 관련 청크 없음 (spec=%s)", spec.spec_name)
+            self.log.warning("LLM Fallback: chunk 없음, 전체 텍스트 사용: spec=%s", spec.spec_name)
+            chunk = parser.get_full_text()[:max_chunk_chars]
+
+        if not chunk:
+            self.log.debug("LLM Fallback 스킵: 텍스트 자체가 없음 (spec=%s)", spec.spec_name)
             return None
         
         # 프롬프트 생성 (힌트 정보 포함)
@@ -9223,6 +9228,8 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             # JSON 추출
             json_match = re.search(r'\{[^{}]+\}', response)
             if not json_match:
+                self.log.warning("LLM 응답에서 JSON을 찾을 수 없음: spec=%s, response=%.200s...",
+                               spec.spec_name, response)
                 return None
 
             data = json.loads(json_match.group())
@@ -9242,6 +9249,8 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             )
 
             if not value:
+                self.log.warning("LLM이 빈 값 반환: spec=%s, JSON=%s",
+                               spec.spec_name, data)
                 return None
 
             # LLM 환각 방지 - 추출된 값이 chunk에 실제로 있는지 검증
@@ -9380,12 +9389,12 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
 
 
 # =============================================================================
-# POSExtractorV61 메인 클래스
+# POSExtractor 메인 클래스
 # =============================================================================
 
-class POSExtractorV61:
+class POSExtractor:
     """
-    POS 사양값 추출기 v61 (PostgreSQL-Enhanced)
+    POS 사양값 추출기
 
     주요 특징:
     - PostgreSQL 전용 모드 (동적 지식 베이스)
@@ -9402,7 +9411,7 @@ class POSExtractorV61:
         config: Config = None,
     ):
         self.config = config or build_config()
-        self.log = logging.getLogger("POSExtractorV61")
+        self.log = logging.getLogger("POSExtractor")
 
         # LLM 관련 속성 사전 초기화 (모드 초기화 전에 선언)
         self.llm_client = None
@@ -9754,6 +9763,12 @@ class POSExtractorV61:
 
                     # HTML 컨텍스트 준비 (최대 2000자)
                     html_context = chunk_context if chunk_context else parser.get_context_for_value(result.value)
+
+                    # Context가 여전히 비어있으면 전체 텍스트 사용 (fallback)
+                    if not html_context or html_context.strip() == "":
+                        self.log.warning("Context 비어있음, 전체 텍스트 fallback 사용: %s", spec.spec_name)
+                        html_context = parser.get_full_text()[:2000]
+
                     if len(html_context) > 2000:
                         html_context = html_context[:2000]
 
@@ -9811,15 +9826,19 @@ class POSExtractorV61:
                     spec.spec_name, llm_result.value, llm_result.unit,
                     chunk_context=""
                 )
-                
+
                 if not errors:
                     self.stats['llm_fallback'] += 1
                     return self._create_result(llm_result, spec, html_path, hint)
                 else:
-                    self.log.debug("LLM Fallback Pre-Check 실패: %s -> %s (errors: %s)",
-                                 spec.spec_name, llm_result.value, errors)
+                    self.log.warning("LLM Fallback Pre-Check 실패: %s -> %s (errors: %s)",
+                                   spec.spec_name, llm_result.value, errors)
             else:
-                self.log.debug("LLM Fallback 결과 없음: %s", spec.spec_name)
+                if llm_result:
+                    self.log.warning("LLM Fallback 결과 있으나 value 비어있음: %s (result: %s)",
+                                   spec.spec_name, llm_result)
+                else:
+                    self.log.warning("LLM Fallback 결과 없음 (None 반환): %s", spec.spec_name)
         
         # 3. 모두 실패
         self.stats['failed'] += 1
@@ -11535,7 +11554,7 @@ def main():
     config = build_config()
 
     logger.info("=" * 70)
-    logger.info("POS Extractor v61 (PostgreSQL-Enhanced)")
+    logger.info("POS Extractor (PostgreSQL-Enhanced)")
     logger.info("=" * 70)
     logger.info("추출 모드: %s", config.extraction_mode.upper())
     logger.info("데이터 소스: %s", config.data_source_mode.upper())
@@ -11544,7 +11563,7 @@ def main():
     logger.info("=" * 70)
 
     # 추출기 초기화
-    extractor = POSExtractorV61(config=config)
+    extractor = POSExtractor(config=config)
     
     # 모드별 실행
     if config.extraction_mode == "light":
