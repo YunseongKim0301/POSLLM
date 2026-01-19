@@ -1224,10 +1224,10 @@ class ExtractionResult:
     errors: List[str] = field(default_factory=list)
     similarity_info: Dict = field(default_factory=dict)
     reference_source: str = ""
-    found: bool = True  # v2에서 추가
-    validation_status: str = ""  # v2에서 추가: "valid", "invalid", "warning", ""
-    validation_message: str = ""  # v2에서 추가
-    compound_values: List[Tuple[str, str]] = field(default_factory=list)  # v2에서 추가
+    found: bool = True 
+    validation_status: str = ""  # "valid", "invalid", "warning", ""
+    validation_message: str = "" 
+    compound_values: List[Tuple[str, str]] = field(default_factory=list) 
     # POS 원문 텍스트 보존
     original_spec_name: str = ""  # POS에 적힌 그대로의 사양명 (소문자, 특수문자 등 보존)
     original_unit: str = ""  # POS에 적힌 그대로의 단위
@@ -4109,7 +4109,7 @@ class HTMLChunkParser:
         self.file_path = file_path
         self.soup = None
         self.tables = []           # 원시 테이블 (2D 배열)
-        self.table_structures = [] # v2에서 추가: 테이블 구조 정보 (헤더, 데이터 행 위치)
+        self.table_structures = [] # 테이블 구조 정보 (헤더, 데이터 행 위치)
         self.kv_pairs = []         # 키-값 쌍 리스트
         self.kv_index = {}         # KV Direct Matching 최적화: 정규화된 키 -> KV 매핑
         self.text_chunks = []
@@ -4379,7 +4379,7 @@ class HTMLChunkParser:
         """
         수평 데이터 테이블 파싱 (row=item, column=attribute)
 
-        v4 개선: 다층 헤더 지원
+        다층 헤더 지원
         """
         rows = table.find_all('tr')
         if not rows:
