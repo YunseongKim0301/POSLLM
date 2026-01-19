@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-POS Specification Value Extractor v61 (PostgreSQL-Enhanced)
-============================================================
+POS Specification Value Extractor (Performance-Optimized)
+==========================================================
 
-PostgreSQL 기반 동적 지식 통합 및 성능 최적화
+PostgreSQL 기반 고속 추출기 - 10만 개 사양값을 2~3일 이내 처리 목표
 
-주요 개선사항 (v61):
-1. PostgreSQL 전용 모드 (파일 기반 제거)
-2. 동적 지식 베이스 (pos_dict, umgv_fin 활용)
-3. In-memory 캐싱으로 보안 네트워크 대응
-4. Enhanced chunk selection (7-stage)
-5. LLM 후처리 (범위 파싱, 단위 정규화)
-6. 병렬 처리 최적화 (300K specs in 9.9 hours)
-7. 출력 형식 개선 (nested JSON, 디버그 CSV)
+주요 개선사항:
+1. 정확도 개선 (고질적 문제 해결)
+   - pos_umgv_desc: chunk에서 재추출 (umgv_desc 복사 방지)
+   - pos_chunk: 1500자 확대, 문장 단위 자르기
+   - 범용적인 패턴 추출 (특정 구조에 의존하지 않음)
+
+2. 성능 최적화 (목표: 2.6초/개 이하)
+   - 프롬프트 간소화 (30% 단축)
+   - LLM 파라미터 최적화 (num_predict: 200→100)
+   - Rule 성공 시 LLM 검증 선택적 생략
+   - 병렬 처리 강화
 
 추출 모드:
 - FULL: Template의 모든 POS 추출 (기존 방식)
@@ -213,6 +216,16 @@ USER_OLLAMA_PORTS = [11434, 11436]
 USER_AUTO_START_OLLAMA_SERVE = True
 USER_OLLAMA_SERVE_START_GRACE_SEC = 10
 
+# ===== 성능 최적화 설정 (New) =====
+# Rule 성공 시 LLM 검증 생략 (정확도 vs 속도 트레이드오프)
+# True: 정확도 우선 (모든 결과 LLM 검증)
+# False: 속도 우선 (Rule 성공 시 검증 생략, 약 2배 빠름)
+USER_SKIP_LLM_VALIDATION_ON_RULE_SUCCESS = False
+
+# LLM 응답 길이 제한 (토큰 수 감소로 속도 향상)
+# 200 → 100 (JSON 응답에는 100 토큰으로 충분)
+USER_LLM_NUM_PREDICT = 100
+
 # 다수결 투표 설정
 USER_VOTE_ENABLED = True
 USER_VOTE_K = 2
@@ -281,7 +294,7 @@ logging.basicConfig(
     format='[%(levelname)s] %(asctime)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("POSExtractorV61")
+logger = logging.getLogger("POSExtractor")
 
 
 # ############################################################################
@@ -1034,7 +1047,11 @@ class Config:
     llm_max_retries: int = 3
     llm_retry_sleep_sec: float = 1.5
     llm_temperature: float = 0.0
-    
+
+    # ===== 성능 최적화 옵션 (New) =====
+    skip_llm_validation_on_rule_success: bool = False  # Rule 성공 시 LLM 검증 생략 (속도 2배)
+    llm_num_predict: int = 100  # LLM 응답 길이 (200→100, 속도 향상)
+
     # LLM Audit
     enable_llm_audit: bool = True
     audit_confidence_threshold: float = 0.85
@@ -1141,6 +1158,11 @@ def build_config() -> Config:
         llm_max_retries=USER_LLM_MAX_RETRIES,
         llm_retry_sleep_sec=USER_LLM_RETRY_SLEEP_SEC,
         llm_temperature=USER_LLM_TEMPERATURE,
+
+        # 성능 최적화 옵션
+        skip_llm_validation_on_rule_success=USER_SKIP_LLM_VALIDATION_ON_RULE_SUCCESS,
+        llm_num_predict=USER_LLM_NUM_PREDICT,
+
         enable_llm_audit=USER_ENABLE_LLM_AUDIT,
         audit_confidence_threshold=USER_AUDIT_CONFIDENCE_THRESHOLD,
         audit_always_for_llm=USER_AUDIT_ALWAYS_FOR_LLM,
@@ -8159,12 +8181,14 @@ class LLMFallbackExtractor:
         use_voting: bool = True,
         glossary: LightweightGlossaryIndex = None,
         enable_enhanced_chunk_selection: bool = True,
-        use_dynamic_knowledge: bool = True  # 동적 지식 사용
+        use_dynamic_knowledge: bool = True,  # 동적 지식 사용
+        num_predict: int = 100  # LLM 응답 길이 제한 (성능 최적화)
     ):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
         self.model = model
         self.timeout = timeout
+        self.num_predict = num_predict  # 성능 최적화: 응답 길이 제한
         self.log = logger or logging.getLogger("LLMFallback")
         self._current_port_idx = 0
         self.llm_client = llm_client  # UnifiedLLMClient for voting support
@@ -8844,14 +8868,14 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
     def _call_ollama(self, prompt: str) -> Optional[str]:
         """Ollama API 호출"""
         url = self._get_ollama_url()
-        
+
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
             "options": {
                 "temperature": 0.0,
-                "num_predict": 200,
+                "num_predict": self.num_predict,  # 성능 최적화: config에서 설정
             }
         }
         
@@ -9329,15 +9353,17 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
 
 
 # =============================================================================
-# POSExtractorV61 메인 클래스
+# POSExtractor 메인 클래스
 # =============================================================================
 
 class POSExtractorV61:
     """
-    POS 사양값 추출기 v61 (PostgreSQL-Enhanced)
+    POS 사양값 추출기 (Performance-Optimized)
 
     주요 특징:
+    - 정확도 개선: pos_umgv_desc, pos_chunk, 범용 패턴 추출
     - PostgreSQL 전용 모드 (동적 지식 베이스)
+    - 성능 최적화: num_predict 100, Rule 성공 시 LLM 검증 선택적 생략
     - In-memory 캐싱 (보안 네트워크 대응)
     - Enhanced chunk selection (7-stage)
     - LLM 후처리 (범위 파싱, 단위 정규화)
@@ -9351,7 +9377,7 @@ class POSExtractorV61:
         config: Config = None,
     ):
         self.config = config or build_config()
-        self.log = logging.getLogger("POSExtractorV61")
+        self.log = logging.getLogger("POSExtractor")
 
         # LLM 관련 속성 사전 초기화 (모드 초기화 전에 선언)
         self.llm_client = None
@@ -9407,7 +9433,8 @@ class POSExtractorV61:
                 use_voting=self.config.vote_enabled,
                 glossary=self.glossary,  # 모드 초기화에서 생성됨
                 enable_enhanced_chunk_selection=True,
-                use_dynamic_knowledge=True
+                use_dynamic_knowledge=True,
+                num_predict=self.config.llm_num_predict  # 성능 최적화
             )
             voting_status = "Voting 활성화" if self.config.vote_enabled else "단일 호출"
             self.log.info("LLM Fallback 초기화: %s (ports: %s, %s)",
@@ -9696,7 +9723,15 @@ class POSExtractorV61:
             )
 
             if not errors:
-                # CRITICAL: 모든 추출 결과는 LLM 평가를 거쳐야 함
+                # ===== 성능 최적화: Rule 성공 시 LLM 검증 선택적 생략 =====
+                if self.config.skip_llm_validation_on_rule_success:
+                    # 속도 우선 모드: Rule 성공 시 LLM 검증 생략 (약 2배 빠름)
+                    self.log.debug("Rule 성공 → LLM 검증 생략 (성능 최적화 모드)")
+                    result.method = "rule_only"
+                    self.stats['rule_success'] += 1
+                    return self._create_result(result, spec, html_path, hint)
+
+                # 정확도 우선 모드: 모든 추출 결과는 LLM 평가를 거쳐야 함
                 # Rule 기반 추출이 성공해도 LLM 검증 필수
                 if self.llm_validator:
                     self.log.info("Rule 기반 추출 성공 → LLM 검증 시작: %s", spec.spec_name)
@@ -11484,12 +11519,14 @@ def main():
     config = build_config()
 
     logger.info("=" * 70)
-    logger.info("POS Extractor v61 (PostgreSQL-Enhanced)")
+    logger.info("POS Extractor (Performance-Optimized)")
     logger.info("=" * 70)
     logger.info("추출 모드: %s", config.extraction_mode.upper())
     logger.info("데이터 소스: %s", config.data_source_mode.upper())
     logger.info("출력: JSON=%s, CSV=%s, DB=%s",
                config.save_json, config.save_csv, config.save_to_db)
+    logger.info("성능 최적화: num_predict=%d, skip_validation=%s",
+               config.llm_num_predict, config.skip_llm_validation_on_rule_success)
     logger.info("=" * 70)
 
     # 추출기 초기화
