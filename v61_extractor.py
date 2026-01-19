@@ -7012,6 +7012,158 @@ class RuleBasedExtractor:
 
         return variants
 
+    def _expand_spec_keywords(self, spec_name: str) -> List[str]:
+        """
+        사양명을 키워드로 분해하여 검색 범위 확장
+
+        예시:
+        - "CAPACITY(SWL)" → ["CAPACITY(SWL)", "CAPACITY", "SWL"]
+        - "MAX. WORKING RADIUS" → ["MAX. WORKING RADIUS", "MAXIMUM", "WORKING RADIUS", "RADIUS"]
+        - "M/E OUTPUT" → ["M/E OUTPUT", "OUTPUT", "M/E"]
+
+        Args:
+            spec_name: 원본 사양명
+
+        Returns:
+            확장된 키워드 리스트 (우선순위 순)
+        """
+        keywords = [spec_name]  # 원본 우선
+
+        # 1. 괄호 처리: "CAPACITY(SWL)" → ["CAPACITY", "SWL"]
+        if '(' in spec_name:
+            # 괄호 앞부분
+            base = spec_name.split('(')[0].strip()
+            if base and base not in keywords:
+                keywords.append(base)
+
+            # 괄호 안 내용
+            paren_match = re.search(r'\(([^)]+)\)', spec_name)
+            if paren_match:
+                paren_content = paren_match.group(1).strip()
+                if paren_content and paren_content not in keywords:
+                    keywords.append(paren_content)
+
+        # 2. 점(.) 처리: "MAX. WORKING RADIUS" → ["MAXIMUM", "WORKING RADIUS"]
+        if '.' in spec_name:
+            # "MAX." → "MAXIMUM" 확장
+            expanded = spec_name.replace('MAX.', 'MAXIMUM').replace('MIN.', 'MINIMUM')
+            if expanded != spec_name and expanded not in keywords:
+                keywords.append(expanded)
+
+            # 점 제거
+            no_dot = spec_name.replace('.', '').strip()
+            if no_dot and no_dot not in keywords:
+                keywords.append(no_dot)
+
+        # 3. 주요 단어 추출 (3글자 이상)
+        words = re.findall(r'[A-Z][A-Z]+', spec_name)  # 대문자 연속
+        for word in words:
+            if len(word) >= 3 and word not in keywords:
+                keywords.append(word)
+
+        # 4. 복합어 분리: "WORKING RADIUS" 추출
+        if ' ' in spec_name:
+            parts = spec_name.split()
+            # 뒤에서 2개 단어 조합
+            if len(parts) >= 2:
+                last_two = ' '.join(parts[-2:])
+                if last_two not in keywords:
+                    keywords.append(last_two)
+
+        return keywords
+
+    def _extract_hierarchical_context(self, chunk: str, match_pos: int) -> str:
+        """
+        매칭 위치 주변의 계층적 구조 추출
+
+        예: "Working radius | Maximum | 19 m"에서 "Maximum" 매칭 시
+        → "Working radius | Maximum" 반환 (상위 컨텍스트 포함)
+
+        전략:
+        1. 매칭 위치에서 앞으로 탐색하여 상위 레벨 찾기
+        2. 구분자(|)로 계층 파악
+        3. 값이 시작되기 전까지만 포함
+
+        Args:
+            chunk: 전체 chunk 텍스트
+            match_pos: 매칭 시작 위치
+
+        Returns:
+            계층적 컨텍스트를 포함한 사양명
+        """
+        # 매칭 위치부터 앞으로 라인 시작까지 역추적
+        line_start = chunk.rfind('\n', 0, match_pos) + 1
+
+        # 매칭 위치부터 뒤로 값 종료까지 추적
+        # 숫자나 단위가 나오면 중단
+        end_pos = match_pos
+        in_spec_name = True
+
+        while end_pos < len(chunk):
+            char = chunk[end_pos]
+
+            # 숫자 시작 전까지만 (값 영역 제외)
+            if char.isdigit():
+                # 단, | 뒤의 숫자는 값이므로 중단
+                # "Working radius | Maximum | 19" → "Maximum" 뒤 19는 값
+                break
+
+            # 줄바꿈이면 중단
+            if char == '\n':
+                break
+
+            # 구분자 | 는 포함 (계층 구조)
+            if char in ['|', ':', '/', '=']:
+                end_pos += 1
+                # | 뒤에 공백 건너뛰기
+                while end_pos < len(chunk) and chunk[end_pos].isspace():
+                    end_pos += 1
+                # 다음 토큰 확인
+                next_word_end = end_pos
+                while next_word_end < len(chunk) and (chunk[next_word_end].isalnum() or chunk[next_word_end] in ['.', "'"]):
+                    next_word_end += 1
+
+                next_word = chunk[end_pos:next_word_end].strip()
+                # 다음 단어가 숫자면 값이므로 중단
+                if next_word and next_word[0].isdigit():
+                    break
+
+                # 알파벳이면 계층의 일부로 포함
+                if next_word and next_word[0].isalpha():
+                    end_pos = next_word_end
+                    continue
+                break
+
+            # 알파벳, 공백, 특수문자 계속
+            if char.isalnum() or char.isspace() or char in ['.', "'", '-', '(', ')']:
+                end_pos += 1
+            else:
+                break
+
+        # 라인 시작부터 종료까지 추출
+        context = chunk[line_start:end_pos].strip()
+
+        # 정리: 값 부분 제거
+        # "Working radius | Maximum | 19 m" → "Working radius | Maximum"
+        parts = context.split('|')
+        result_parts = []
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            # 첫 글자가 숫자면 값이므로 제외
+            if part and part[0].isdigit():
+                break
+
+            # 순수 텍스트 또는 키워드면 포함
+            result_parts.append(part)
+
+        result = ' | '.join(result_parts)
+
+        return result if result else context
+
     def _extract_original_spec_name_from_chunk(
         self,
         chunk: str,
@@ -7019,15 +7171,21 @@ class RuleBasedExtractor:
         hint: ExtractionHint = None
     ) -> str:
         """
-        Chunk 텍스트에서 원본 사양명 추출
+        Chunk 텍스트에서 원본 사양명 추출 (개선 버전)
 
-        목표: POS 문서에 실제로 적혀있는 사양명을 그대로 추출
-        예: "Hoisting capacity | SWL 6 tonnes" → "Hoisting capacity"
+        목표: POS 문서에 실제로 적혀있는 사양명을 문맥과 함께 추출
+
+        예시:
+        1. "Hoisting capacity | SWL 6 tonnes" + spec="CAPACITY(SWL)"
+           → "Hoisting capacity" (키워드 분해로 "CAPACITY" 매칭)
+
+        2. "Working radius | Maximum | 19 m" + spec="MAX. WORKING RADIUS"
+           → "Working radius | Maximum" (계층 구조 인식)
 
         전략:
-        1. spec.spec_name과 동의어들을 chunk에서 검색
-        2. 대소문자 구분 없이 찾되, 원본 표기 그대로 반환
-        3. 매칭된 부분의 원본 텍스트를 추출
+        1. 키워드 확장: "CAPACITY(SWL)" → ["CAPACITY", "SWL"]
+        2. 계층적 문맥 추출: 상위-하위 관계 인식
+        3. 원본 표기 보존: 대소문자, 특수문자 유지
 
         Args:
             chunk: POS 문서 chunk 텍스트
@@ -7035,80 +7193,56 @@ class RuleBasedExtractor:
             hint: 추출 힌트
 
         Returns:
-            원본 사양명 (chunk에서 추출) 또는 빈 문자열
+            원본 사양명 (문맥 포함) 또는 빈 문자열
         """
         if not chunk:
             return ""
 
-        # 검색할 사양명 변형 목록 (원본 + 동의어)
+        # 1단계: 기본 변형 목록
         variants = self._get_spec_name_variants(spec.spec_name, hint)
 
-        # 각 변형에 대해 chunk에서 검색
+        # 2단계: 키워드 확장 (각 변형마다)
+        expanded_keywords = []
         for variant in variants:
+            keywords = self._expand_spec_keywords(variant)
+            for kw in keywords:
+                if kw and kw not in expanded_keywords:
+                    expanded_keywords.append(kw)
+
+        # 검색 우선순위: 원본 변형 → 확장 키워드
+        search_terms = variants + [kw for kw in expanded_keywords if kw not in variants]
+
+        best_match = None
+        best_match_length = 0
+
+        # 각 검색어로 시도
+        for search_term in search_terms:
             # 대소문자 구분 없이 검색
-            pattern = re.compile(re.escape(variant), re.IGNORECASE)
+            pattern = re.compile(re.escape(search_term), re.IGNORECASE)
             match = pattern.search(chunk)
 
             if match:
-                # 매칭된 원본 텍스트 반환 (대소문자 보존)
-                original_text = match.group(0)
+                # 계층적 컨텍스트 추출
+                context = self._extract_hierarchical_context(chunk, match.start())
 
-                # 주변 컨텍스트 확인하여 정확한 사양명 경계 찾기
-                # 예: "Hoisting capacity: 6 tonnes" → "Hoisting capacity"
-                # 또는 "CAPACITY (SWL)" → "CAPACITY"
+                # 정리: 앞뒤 공백, 줄바꿈 제거
+                context = context.strip()
 
-                # 매칭 위치
-                start_pos = match.start()
-                end_pos = match.end()
+                # 최소 길이 검증 (너무 짧으면 무시)
+                if len(context) < 2:
+                    continue
 
-                # 앞쪽으로 확장 (가능한 경우)
-                # 예: "Hoisting capacity" 전체를 잡기 위해
-                extended_start = start_pos
-                while extended_start > 0 and chunk[extended_start - 1].isalpha():
-                    extended_start -= 1
+                # 더 긴 매칭 우선 (더 구체적)
+                if len(context) > best_match_length:
+                    best_match = context
+                    best_match_length = len(context)
 
-                # 뒤쪽으로 확장
-                extended_end = end_pos
-                # | : - 등의 구분자 전까지 확장
-                while extended_end < len(chunk):
-                    char = chunk[extended_end]
-                    if char in ['|', ':', '/', '=', '\n', '\t']:
-                        break
-                    if char.isalnum() or char.isspace() or char in ['(', ')']:
-                        extended_end += 1
-                    else:
-                        break
-
-                # 확장된 텍스트 추출 및 정리
-                extended_text = chunk[extended_start:extended_end].strip()
-
-                # 괄호 제거 및 정리
-                # 예: "CAPACITY (SWL)" → "CAPACITY"
-                # 단, 괄호가 값 표기인 경우는 보존
-                # 사양명 부분만 추출 (값은 제외)
-                spec_name_part = extended_text.split('|')[0].strip()  # | 앞부분만
-                spec_name_part = spec_name_part.split(':')[0].strip()  # : 앞부분만
-                spec_name_part = spec_name_part.split('/')[0].strip()  # / 앞부분만 (일부 경우)
-
-                # 괄호 처리: 사양명에 괄호가 포함된 경우와 아닌 경우 구분
-                # 예: "CAPACITY (SWL)" vs "Capacity: 6 (tonnes)"
-                # 간단한 휴리스틱: 괄호 안이 단위나 약어가 아니면 제거
-                if '(' in spec_name_part:
-                    # 괄호 앞부분만 추출 (보수적 접근)
-                    spec_name_part = spec_name_part.split('(')[0].strip()
-
-                # 최종 정리
-                spec_name_part = spec_name_part.strip()
-
-                if spec_name_part and len(spec_name_part) >= 3:
                     self.log.debug(
-                        f"Extracted original spec name: '{spec_name_part}' "
-                        f"(from variant: '{variant}', chunk: '{chunk[:100]}')"
+                        f"Found spec name: '{context}' "
+                        f"(keyword: '{search_term}', spec: '{spec.spec_name}')"
                     )
-                    return spec_name_part
 
-        # 매칭 실패시 빈 문자열
-        return ""
+        return best_match if best_match else ""
 
     def extract(
         self,
@@ -8428,13 +8562,140 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             self.log.error("Ollama 호출 오류: %s", e)
             return None
     
+    def _expand_spec_keywords(self, spec_name: str) -> List[str]:
+        """
+        사양명을 키워드로 분해하여 검색 범위 확장
+        (RuleBasedExtractor와 동일한 로직)
+        """
+        keywords = [spec_name]
+
+        if '(' in spec_name:
+            base = spec_name.split('(')[0].strip()
+            if base and base not in keywords:
+                keywords.append(base)
+            paren_match = re.search(r'\(([^)]+)\)', spec_name)
+            if paren_match:
+                paren_content = paren_match.group(1).strip()
+                if paren_content and paren_content not in keywords:
+                    keywords.append(paren_content)
+
+        if '.' in spec_name:
+            expanded = spec_name.replace('MAX.', 'MAXIMUM').replace('MIN.', 'MINIMUM')
+            if expanded != spec_name and expanded not in keywords:
+                keywords.append(expanded)
+            no_dot = spec_name.replace('.', '').strip()
+            if no_dot and no_dot not in keywords:
+                keywords.append(no_dot)
+
+        words = re.findall(r'[A-Z][A-Z]+', spec_name)
+        for word in words:
+            if len(word) >= 3 and word not in keywords:
+                keywords.append(word)
+
+        if ' ' in spec_name:
+            parts = spec_name.split()
+            if len(parts) >= 2:
+                last_two = ' '.join(parts[-2:])
+                if last_two not in keywords:
+                    keywords.append(last_two)
+
+        return keywords
+
+    def _extract_hierarchical_context(self, chunk: str, match_pos: int) -> str:
+        """
+        매칭 위치 주변의 계층적 구조 추출
+        (RuleBasedExtractor와 동일한 로직)
+        """
+        line_start = chunk.rfind('\n', 0, match_pos) + 1
+        end_pos = match_pos
+
+        while end_pos < len(chunk):
+            char = chunk[end_pos]
+            if char.isdigit():
+                break
+            if char == '\n':
+                break
+            if char in ['|', ':', '/', '=']:
+                end_pos += 1
+                while end_pos < len(chunk) and chunk[end_pos].isspace():
+                    end_pos += 1
+                next_word_end = end_pos
+                while next_word_end < len(chunk) and (chunk[next_word_end].isalnum() or chunk[next_word_end] in ['.', "'"]):
+                    next_word_end += 1
+                next_word = chunk[end_pos:next_word_end].strip()
+                if next_word and next_word[0].isdigit():
+                    break
+                if next_word and next_word[0].isalpha():
+                    end_pos = next_word_end
+                    continue
+                break
+            if char.isalnum() or char.isspace() or char in ['.', "'", '-', '(', ')']:
+                end_pos += 1
+            else:
+                break
+
+        context = chunk[line_start:end_pos].strip()
+        parts = context.split('|')
+        result_parts = []
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if part and part[0].isdigit():
+                break
+            result_parts.append(part)
+
+        result = ' | '.join(result_parts)
+        return result if result else context
+
+    def _improve_original_spec_name(self, chunk: str, spec: SpecItem, llm_suggested: str) -> str:
+        """
+        LLM이 제안한 original_spec_name을 chunk에서 개선
+
+        Args:
+            chunk: POS 문서 chunk
+            spec: 사양 항목
+            llm_suggested: LLM이 제안한 사양명
+
+        Returns:
+            개선된 사양명 (계층적 맥락 포함)
+        """
+        if not chunk or not spec.spec_name:
+            return llm_suggested
+
+        # 키워드 확장
+        keywords = self._expand_spec_keywords(spec.spec_name)
+
+        # LLM 제안도 키워드에 추가
+        if llm_suggested and llm_suggested not in keywords:
+            keywords.insert(0, llm_suggested)  # 우선순위 높임
+
+        best_match = None
+        best_match_length = 0
+
+        for keyword in keywords:
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+            match = pattern.search(chunk)
+
+            if match:
+                context = self._extract_hierarchical_context(chunk, match.start())
+                context = context.strip()
+
+                if len(context) >= 2 and len(context) > best_match_length:
+                    best_match = context
+                    best_match_length = len(context)
+
+        # 개선된 매칭이 없으면 LLM 제안 사용
+        return best_match if best_match else llm_suggested
+
     def _parse_llm_response(
         self,
         response: str,
         spec: SpecItem,
         chunk: str
     ) -> Optional[ExtractionResult]:
-        """LLM 응답 파싱"""
+        """LLM 응답 파싱 (개선 버전)"""
         try:
             # JSON 추출
             json_match = re.search(r'\{[^{}]+\}', response)
@@ -8447,10 +8708,15 @@ Output: {{"value": "700", "unit": "m³/h", "confidence": 0.95, "original_spec_na
             unit = data.get("unit", "").strip()
             confidence = float(data.get("confidence", 0.0))
 
-            # POS 원문 텍스트 추출
-            original_spec_name = data.get("original_spec_name", "").strip()
+            # POS 원문 텍스트 추출 (LLM 제안)
+            llm_original_spec = data.get("original_spec_name", "").strip()
             original_unit = data.get("original_unit", "").strip()
             original_equipment = data.get("original_equipment", "").strip()
+
+            # ★ 개선: LLM 제안을 chunk에서 검증 및 확장
+            original_spec_name = self._improve_original_spec_name(
+                chunk, spec, llm_original_spec
+            )
 
             if not value:
                 return None
