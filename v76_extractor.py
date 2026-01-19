@@ -225,7 +225,13 @@ USER_LLM_WORKERS = 2
 
 # 배치 처리 설정
 USER_BATCH_SIZE = 15
-USER_MAX_EVIDENCE_CHARS = 15000
+
+# LLM Context 설정
+# CRITICAL: Ollama 기본 context는 4096 tokens (약 16KB text)로 부족함
+# Gemma3는 128K context 지원하므로 32K로 설정 권장
+# 설정 방법: OLLAMA_NUM_CTX=32768 ollama serve
+USER_MAX_EVIDENCE_CHARS = 8000  # 8KB (프롬프트 포함 약 10-12KB = 2.5-3K tokens)
+USER_OLLAMA_NUM_CTX = 32768  # Ollama context length (tokens)
 
 # LLM 호출 안정화
 USER_LLM_RATE_LIMIT_SEC = 0.3
@@ -1012,6 +1018,7 @@ class Config:
     ollama_timeout: int = 180
     ollama_host: str = "127.0.0.1"
     ollama_ports: List[int] = field(default_factory=lambda: [11434])
+    ollama_num_ctx: int = 32768  # Context length (tokens) - Gemma3 supports up to 128K
     auto_start_ollama: bool = True
     ollama_start_grace_sec: int = 10
     
@@ -1027,7 +1034,7 @@ class Config:
     
     # 배치 처리
     batch_size: int = 15
-    max_evidence_chars: int = 15000
+    max_evidence_chars: int = 8000  # 8KB (with prompt ~10-12KB = 2.5-3K tokens)
     
     # LLM 안정화
     llm_rate_limit_sec: float = 0.3
@@ -6615,8 +6622,8 @@ class LLMChunkSelector:
 
         # LLM 호출
         try:
-            response = self.llm_client.generate(prompt)
-            selected_idx = self._parse_selection_response(response, len(top_candidates))
+            response_text, _, _ = self.llm_client.generate(prompt)
+            selected_idx = self._parse_selection_response(response_text, len(top_candidates))
 
             if selected_idx is not None and 0 <= selected_idx < len(top_candidates):
                 selected = top_candidates[selected_idx]
@@ -7924,6 +7931,7 @@ class UnifiedLLMClient:
                  model: str = "gemma3:27b", timeout: int = 180,
                  temperature: float = 0.0, max_retries: int = 3,
                  retry_sleep: float = 1.5, rate_limit: float = 0.3,
+                 num_ctx: int = 32768,
                  logger: logging.Logger = None):
         self.host = ollama_host
         self.ports = ollama_ports or [11434]
@@ -7933,6 +7941,7 @@ class UnifiedLLMClient:
         self.max_retries = max_retries
         self.retry_sleep = retry_sleep
         self.rate_limit = rate_limit
+        self.num_ctx = num_ctx
         self.logger = logger or logging.getLogger("UnifiedLLMClient")
 
         # 포트 로테이션
@@ -7966,7 +7975,10 @@ class UnifiedLLMClient:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": self.temperature}
+            "options": {
+                "temperature": self.temperature,
+                "num_ctx": self.num_ctx
+            }
         }
 
         for attempt in range(self.max_retries):
@@ -9488,6 +9500,7 @@ class POSExtractor:
                 max_retries=self.config.llm_max_retries,
                 retry_sleep=self.config.llm_retry_sleep_sec,
                 rate_limit=self.config.llm_rate_limit_sec,
+                num_ctx=self.config.ollama_num_ctx,
                 logger=self.log
             )
             self.log.info("UnifiedLLMClient 초기화: %s (ports: %s)",
