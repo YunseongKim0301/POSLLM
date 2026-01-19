@@ -1,180 +1,151 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-POS 추출 테스트 스크립트 (Windows PC용)
+v61_extractor.py 실제 테스트 스크립트
+POS HTML 파일에서 사양 추출 테스트
 """
 
-import os
 import sys
 import json
-import logging
 from pathlib import Path
 
-# v53_extractor 임포트
-from v53_extractor import (
-    POSExtractorV52,
-    Config,
-    SpecItem
-)
+# v61_extractor 임포트
+from v61_extractor import POSExtractorV61, SpecItem, build_config
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def test_extraction():
+    """실제 POS 파일로 추출 테스트"""
 
+    # 1. 테스트할 POS 파일 선택
+    test_html = "/home/user/POSLLM/2550-POS-0077601_001_02_A4(16).html"
 
-def create_test_config():
-    """테스트용 Config 생성"""
-    config = Config()
-
-    # 기본 설정
-    config.extraction_mode = "light"
-    config.data_source_mode = "file"  # 파일 모드 (PostgreSQL 없이 테스트)
-
-    # 경로 설정
-    base_dir = Path(__file__).parent
-    config.base_folder = str(base_dir)
-    config.light_mode_pos_folder = str(base_dir / "uploaded_files")
-    config.glossary_path = str(base_dir / "test_data" / "pos_dict.txt")
-    config.specdb_path = str(base_dir / "test_data" / "umgv_fin.txt")
-    config.spec_path = str(base_dir / "test_data" / "ext_tmpl.txt")
-    config.output_path = str(base_dir / "output")
-
-    # LLM 설정
-    config.use_llm = True
-    config.enable_llm_fallback = True
-    config.ollama_model = "qwen2.5:32b"  # 또는 "gemma2:27b"
-    config.ollama_host = "127.0.0.1"
-    config.ollama_ports = [11434]
-    config.ollama_timeout = 180
-
-    # Voting 설정
-    config.vote_enabled = True
-    config.vote_k = 2  # 테스트용으로 2로 설정
-    config.vote_min_agreement = 2
-
-    # 출력 설정
-    config.save_json = True
-    config.save_csv = True
-    config.save_debug_csv = True
-
-    # 임베딩 비활성화 (PostgreSQL 없이 테스트)
-    config.use_precomputed_embeddings = False
-    config.enable_semantic_search = False
-
-    return config
-
-
-def load_test_specs(spec_file):
-    """테스트용 사양 목록 로드"""
-    specs = []
-
-    if not os.path.exists(spec_file):
-        logger.warning(f"템플릿 파일 없음: {spec_file}")
-        return specs
-
-    # 간단한 CSV 파싱 (헤더 스킵)
-    with open(spec_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-
-    for i, line in enumerate(lines):
-        if i == 0:  # 헤더 스킵
-            continue
-
-        parts = line.strip().split('\t')  # TSV 형식 가정
-        if len(parts) >= 3:
-            spec = SpecItem(
-                spec_name=parts[0].strip(),
-                spec_code=parts[1].strip() if len(parts) > 1 else "",
-                equipment=parts[2].strip() if len(parts) > 2 else "",
-                expected_unit=parts[3].strip() if len(parts) > 3 else "",
-                hull="",
-                matnr=""
-            )
-            specs.append(spec)
-
-    logger.info(f"로드된 사양 수: {len(specs)}")
-    return specs
-
-
-def test_single_extraction():
-    """단일 POS 파일 테스트"""
-    logger.info("=" * 80)
-    logger.info("POS 추출 테스트 시작")
-    logger.info("=" * 80)
-
-    # Config 생성
-    config = create_test_config()
-
-    # 출력 디렉토리 생성
-    os.makedirs(config.output_path, exist_ok=True)
-
-    # Extractor 초기화
-    logger.info("Extractor 초기화 중...")
-    extractor = POSExtractorV52(config, mode="light")
-    extractor.initialize()
-
-    # POS 파일 찾기
-    pos_folder = Path(config.light_mode_pos_folder)
-    html_files = list(pos_folder.glob("*.html"))
-
-    if not html_files:
-        logger.error(f"POS 파일을 찾을 수 없습니다: {pos_folder}")
+    if not Path(test_html).exists():
+        print(f"❌ Error: HTML file not found: {test_html}")
         return
 
-    test_file = html_files[0]
-    logger.info(f"테스트 파일: {test_file.name}")
+    print(f"📄 Testing with: {test_html}")
+    print("=" * 80)
 
-    # 사양 목록 로드
-    specs = load_test_specs(config.spec_path)
-    if not specs:
-        logger.error("사양 목록을 로드할 수 없습니다")
+    # 2. Config 생성 (기본 설정 사용)
+    config = build_config()
+    config.extraction_mode = "light"  # light mode: PostgreSQL 없이 실행
+    config.use_llm = False  # LLM 비활성화 (먼저 Rule 기반만 테스트)
+
+    # 3. Extractor 초기화
+    print("\n🔧 Initializing extractor...")
+    try:
+        extractor = POSExtractorV61(
+            glossary_path="",  # 빈 문자열로 설정
+            specdb_path="",
+            config=config
+        )
+        print("✅ Extractor initialized successfully")
+    except Exception as e:
+        print(f"❌ Failed to initialize: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
-    # 추출 테스트 (처음 5개만)
-    results = []
-    test_specs = specs[:5]
+    # 4. 테스트할 사양 정의
+    specs = [
+        SpecItem(
+            spec_name="CAPACITY",
+            equipment="",
+            expected_unit="m3/h",
+            hull="2550"
+        ),
+        SpecItem(
+            spec_name="MOTOR POWER",
+            equipment="",
+            expected_unit="kW",
+            hull="2550"
+        ),
+        SpecItem(
+            spec_name="VOLTAGE",
+            equipment="",
+            expected_unit="V",
+            hull="2550"
+        ),
+        SpecItem(
+            spec_name="FREQUENCY",
+            equipment="",
+            expected_unit="Hz",
+            hull="2550"
+        ),
+        SpecItem(
+            spec_name="MOTOR RPM",
+            equipment="",
+            expected_unit="rpm",
+            hull="2550"
+        ),
+    ]
 
-    logger.info(f"추출 시작: {len(test_specs)}개 사양")
+    print(f"\n📊 Testing {len(specs)} specifications:")
+    for spec in specs:
+        print(f"  - {spec.spec_name} ({spec.expected_unit})")
 
-    for i, spec in enumerate(test_specs, 1):
-        logger.info(f"[{i}/{len(test_specs)}] 추출 중: {spec.spec_name}")
+    # 5. 추출 실행
+    print("\n🚀 Starting extraction...")
+    print("=" * 80)
 
-        try:
-            result = extractor.extract_single(str(test_file), spec)
-            results.append(result)
+    try:
+        results = extractor.extract_batch(test_html, specs)
 
-            # 결과 출력
-            if result.get('pos_umgv_value'):
-                logger.info(f"  ✓ 성공: {result['pos_umgv_value']} {result.get('pos_umgv_uom', '')}")
+        # 6. 결과 출력
+        print("\n📈 Extraction Results:")
+        print("=" * 80)
+
+        success_count = 0
+        fail_count = 0
+
+        for spec in specs:
+            result = results.get(spec.spec_name)
+
+            if result and result.value:
+                success_count += 1
+                print(f"\n✅ {spec.spec_name}:")
+                print(f"   Value: {result.value}")
+                print(f"   Unit: {result.unit}")
+                print(f"   Confidence: {result.confidence:.2f}")
+                print(f"   Method: {result.method}")
+                if result.evidence:
+                    evidence_preview = result.evidence[:100].replace('\n', ' ')
+                    print(f"   Evidence: {evidence_preview}...")
             else:
-                logger.warning(f"  ✗ 실패: {result.get('_method', 'UNKNOWN')}")
+                fail_count += 1
+                print(f"\n❌ {spec.spec_name}: NOT FOUND")
 
-        except Exception as e:
-            logger.error(f"  ✗ 오류: {e}")
+        # 7. 통계 출력
+        print("\n" + "=" * 80)
+        print("📊 Statistics:")
+        print(f"   Total: {len(specs)}")
+        print(f"   Success: {success_count} ({success_count/len(specs)*100:.1f}%)")
+        print(f"   Failed: {fail_count} ({fail_count/len(specs)*100:.1f}%)")
+        print("=" * 80)
 
-    # 결과 저장
-    output_file = Path(config.output_path) / "test_results.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+        # 8. JSON 파일로 저장
+        output_file = "/home/user/POSLLM/test_results.json"
+        output_data = {}
+        for spec in specs:
+            result = results.get(spec.spec_name)
+            output_data[spec.spec_name] = {
+                "value": result.value if result else "",
+                "unit": result.unit if result else "",
+                "confidence": result.confidence if result else 0.0,
+                "method": result.method if result else "",
+                "evidence": result.evidence[:200] if result and result.evidence else ""
+            }
 
-    logger.info(f"결과 저장: {output_file}")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-    # 통계 출력
-    success_count = sum(1 for r in results if r.get('pos_umgv_value'))
-    logger.info("=" * 80)
-    logger.info(f"추출 완료: {success_count}/{len(results)} ({success_count/len(results)*100:.1f}%)")
-    logger.info("=" * 80)
+        print(f"\n💾 Results saved to: {output_file}")
 
-    return results
+        return success_count, fail_count
 
+    except Exception as e:
+        print(f"\n❌ Extraction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0, len(specs)
 
 if __name__ == "__main__":
-    try:
-        results = test_single_extraction()
-    except KeyboardInterrupt:
-        logger.info("\n사용자에 의해 중단됨")
-    except Exception as e:
-        logger.error(f"오류 발생: {e}", exc_info=True)
+    test_extraction()
