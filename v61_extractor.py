@@ -4104,6 +4104,7 @@ class HTMLChunkParser:
         self.tables = []           # 원시 테이블 (2D 배열)
         self.table_structures = [] # v2에서 추가: 테이블 구조 정보 (헤더, 데이터 행 위치)
         self.kv_pairs = []         # 키-값 쌍 리스트
+        self.kv_index = {}         # KV Direct Matching 최적화: 정규화된 키 -> KV 매핑
         self.text_chunks = []
 
         if file_path and os.path.exists(file_path):
@@ -4240,6 +4241,46 @@ class HTMLChunkParser:
                 seen.add(pair_signature)
                 self.kv_pairs.append(pair)
 
+        # KV Direct Matching 인덱스 구축 (O(1) 조회)
+        self._build_kv_index()
+
+    def _build_kv_index(self):
+        """
+        KV Direct Matching 최적화: 정규화된 키를 인덱스로 저장
+
+        여러 정규화 버전을 저장하여 다양한 매칭 시도를 빠르게 처리:
+        1. 완전 정규화 (공백/특수문자 제거)
+        2. 번호 prefix 제거
+        3. 계층적 키의 spec 부분만
+        """
+        self.kv_index = {}
+
+        def normalize_key_simple(key: str) -> str:
+            """간단한 정규화 - 번호 prefix 제거, 공백 정리"""
+            key = key.strip()
+            key = re.sub(r'^[A-Z]?\d+[\)\.\:\-]\s*', '', key)  # 번호 제거
+            key = re.sub(r'[_\-\s]+', ' ', key).strip()  # 공백 정규화
+            return key.upper()
+
+        for kv in self.kv_pairs:
+            original_key = kv['key']
+
+            # 1. 완전 정규화 버전 (aggressive)
+            norm_key = self._aggressive_normalize(original_key)
+            if norm_key and norm_key not in self.kv_index:
+                self.kv_index[norm_key] = kv
+
+            # 2. 간단한 정규화 버전 (공백 유지)
+            simple_norm = normalize_key_simple(original_key)
+            if simple_norm and simple_norm not in self.kv_index:
+                self.kv_index[simple_norm] = kv
+
+            # 3. 계층적 키의 spec 부분만 추출
+            if '_' in original_key or '(' in original_key:
+                parsed = self._parse_hierarchical_key(original_key)
+                if parsed['spec'] and parsed['spec'] not in self.kv_index:
+                    self.kv_index[parsed['spec']] = kv
+
     def _aggressive_normalize(self, text: str) -> str:
         """강화된 정규화 (v61_standalone_test.py 이식)"""
         if not text:
@@ -4250,6 +4291,61 @@ class HTMLChunkParser:
         # 숫자 내 쉼표 제거 (1,000 → 1000)
         text = text.replace(',', '')
         return text.upper()
+
+    def verify_value_in_document(self, value: str, unit: str = "") -> bool:
+        """
+        단위 변환 검증: 추출된 값이 원본 문서에 실제로 존재하는지 확인
+
+        Purpose:
+        - 단위 변환이 발생하지 않았는지 검증 (Ctrl+F 테스트)
+        - 예: "1000" 추출 시 문서에 "1000", "1,000" 등이 있는지 확인
+
+        Args:
+            value: 추출된 값
+            unit: 추출된 단위 (선택)
+
+        Returns:
+            True if value exists in document, False otherwise
+        """
+        if not value or not self.html_content:
+            return True  # 검증 불가 시 통과
+
+        # 검색 패턴 생성
+        search_patterns = []
+
+        # 1. 값 + 단위 조합
+        if unit:
+            # "6 tonnes", "6tonnes", "6 ton"
+            search_patterns.append(f"{value}\\s*{unit}")
+            search_patterns.append(f"{value}{unit}")
+
+        # 2. 값만 (쉼표 포함/제외)
+        # "1000" → ["1000", "1,000"]
+        clean_value = value.replace(',', '')
+        if clean_value.isdigit() and len(clean_value) >= 4:
+            # 천 단위 쉼표 추가
+            formatted = "{:,}".format(int(clean_value))
+            search_patterns.append(clean_value)
+            search_patterns.append(formatted)
+        else:
+            search_patterns.append(value)
+
+        # HTML 컨텐츠에서 검색 (대소문자 무시)
+        html_lower = self.html_content.lower()
+
+        for pattern in search_patterns:
+            # 정규식으로 검색
+            if re.search(re.escape(pattern.lower()), html_lower):
+                return True
+
+        # 추가: 소수점 형식 변환 (3.5 vs 3,5)
+        if '.' in value:
+            comma_version = value.replace('.', ',')
+            if re.search(re.escape(comma_version.lower()), html_lower):
+                return True
+
+        # 어떤 패턴도 찾지 못함 - 변환이 발생했을 가능성
+        return False
 
     def _detect_header_row_v3(self, row_cells: List[str]) -> bool:
         """헤더 행 감지 (v3)"""
@@ -4472,6 +4568,145 @@ class HTMLChunkParser:
         
         return key
     
+    def _compute_fuzzy_match_score(self, key: str, spec_name: str, equipment: str = "",
+                                    expected_unit: str = "") -> float:
+        """
+        개선된 Fuzzy Matching 점수 계산 (토큰 기반)
+
+        가중치:
+        - Spec name: 40%
+        - Equipment: 30%
+        - Unit: 30%
+
+        Args:
+            key: 테이블 키 (예: "Motor Power_Main Engine")
+            spec_name: 대상 사양명
+            equipment: 대상 장비명 (선택)
+            expected_unit: 예상 단위 (선택)
+
+        Returns:
+            0.0 ~ 1.0 점수 (높을수록 유사)
+        """
+        # 계층적 키 파싱
+        parsed = self._parse_hierarchical_key(key)
+
+        score = 0.0
+        weights = {'spec': 0.4, 'equipment': 0.3, 'unit': 0.3}
+
+        # 1. Spec name 매칭 (40%)
+        if parsed['spec']:
+            spec_tokens = set(parsed['spec'].upper().split())
+            target_tokens = set(spec_name.upper().split())
+
+            if spec_tokens == target_tokens:
+                score += weights['spec']  # 완벽 매칭
+            else:
+                # Token overlap ratio
+                common = spec_tokens & target_tokens
+                union = spec_tokens | target_tokens
+                if union:
+                    overlap_ratio = len(common) / len(union)
+                    score += weights['spec'] * overlap_ratio
+
+        # 2. Equipment 매칭 (30%)
+        if equipment and parsed['equipment']:
+            equip_tokens = set(parsed['equipment'].upper().split())
+            target_equip_tokens = set(equipment.upper().split())
+
+            if equip_tokens == target_equip_tokens:
+                score += weights['equipment']
+            else:
+                common = equip_tokens & target_equip_tokens
+                union = equip_tokens | target_equip_tokens
+                if union:
+                    overlap_ratio = len(common) / len(union)
+                    score += weights['equipment'] * overlap_ratio
+        elif not equipment or not parsed['equipment']:
+            # Equipment가 둘 다 없으면 가중치를 spec에 재분배
+            score += weights['equipment'] * 0.5  # 중립적 점수
+
+        # 3. Unit 매칭 (30%)
+        if expected_unit and parsed['unit']:
+            unit_norm = parsed['unit'].upper().replace(' ', '').replace('/', '')
+            expected_norm = expected_unit.upper().replace(' ', '').replace('/', '')
+
+            if unit_norm == expected_norm:
+                score += weights['unit']
+            elif unit_norm in expected_norm or expected_norm in unit_norm:
+                score += weights['unit'] * 0.7  # 부분 매칭
+        elif not expected_unit or not parsed['unit']:
+            # Unit이 둘 다 없으면 가중치를 spec에 재분배
+            score += weights['unit'] * 0.5
+
+        return score
+
+    def _parse_hierarchical_key(self, key: str) -> Dict[str, str]:
+        """
+        계층적 키 파싱
+
+        형식: "<index>_<spec>_<equipment>(<unit>)#" 또는 "<spec>_<equipment>"
+
+        예시:
+        - "1_Capacity_Air volume(m3/h)#" → {index: "1", spec: "CAPACITY", equipment: "Air volume", unit: "m3/h"}
+        - "Motor Power_Main Engine" → {spec: "MOTOR POWER", equipment: "Main Engine"}
+        - "CAPACITY(m³/h)" → {spec: "CAPACITY", unit: "m³/h"}
+
+        Returns:
+            Dictionary with keys: index, spec, equipment, unit (missing keys have empty strings)
+        """
+        result = {
+            'index': '',
+            'spec': '',
+            'equipment': '',
+            'unit': ''
+        }
+
+        if not key:
+            return result
+
+        key = key.strip().rstrip('#')  # Remove trailing #
+
+        # Extract unit from parentheses if present
+        unit_match = re.search(r'\(([^)]+)\)\s*$', key)
+        if unit_match:
+            result['unit'] = unit_match.group(1).strip()
+            key = key[:unit_match.start()].strip()
+
+        # Split by underscore
+        parts = key.split('_')
+
+        if len(parts) == 1:
+            # Simple key: just spec name (or spec + unit in parens)
+            result['spec'] = parts[0].strip().upper()
+        elif len(parts) == 2:
+            # Two parts: could be "index_spec" or "spec_equipment"
+            first = parts[0].strip()
+            second = parts[1].strip()
+
+            # Check if first part is a number (index)
+            if re.match(r'^\d+$', first):
+                result['index'] = first
+                result['spec'] = second.upper()
+            else:
+                # spec_equipment
+                result['spec'] = first.upper()
+                result['equipment'] = second
+        elif len(parts) >= 3:
+            # Three or more parts: "index_spec_equipment" or "spec_subspec_equipment"
+            first = parts[0].strip()
+
+            if re.match(r'^\d+$', first):
+                # index_spec_equipment
+                result['index'] = first
+                result['spec'] = parts[1].strip().upper()
+                result['equipment'] = '_'.join(parts[2:]).strip()
+            else:
+                # spec_subspec_equipment (treat first N-1 parts as spec)
+                result['spec'] = '_'.join(parts[:-1]).upper()
+                result['equipment'] = parts[-1].strip()
+
+        return result
+
     def _is_likely_header_row_v2(self, cells: List[str]) -> bool:
         """
         헤더 행인지 판단 (v2 개선: 키워드 카운트 기반)
@@ -4798,7 +5033,68 @@ class HTMLChunkParser:
         
         # 스펙 이름 정규화
         spec_normalized = normalize_key(spec_upper)
-        
+
+        # 0a. KV Direct Matching (O(1) 인덱스 조회 - 가장 빠름)
+        # 여러 정규화 버전으로 시도
+        for variant in variants:
+            # Aggressive normalization
+            norm_variant = self._aggressive_normalize(variant)
+            if norm_variant in self.kv_index:
+                kv = self.kv_index[norm_variant]
+                value = kv['value']
+                clean_value, unit = self._parse_value_unit(value)
+                if clean_value and self._is_valid_value(clean_value, spec_upper):
+                    # 단위 변환 검증
+                    if self.verify_value_in_document(clean_value, unit):
+                        return (clean_value, unit, f"{kv['key']} | {value}")
+
+            # Simple normalization
+            simple_norm = normalize_key(variant)
+            if simple_norm in self.kv_index:
+                kv = self.kv_index[simple_norm]
+                value = kv['value']
+                clean_value, unit = self._parse_value_unit(value)
+                if clean_value and self._is_valid_value(clean_value, spec_upper):
+                    return (clean_value, unit, f"{kv['key']} | {value}")
+
+        # 0. 계층적 키 매칭 (가장 먼저 시도)
+        # "1_Capacity_Air volume(m3/h)#" 같은 복잡한 키 처리
+        for kv in self.kv_pairs:
+            if '_' in kv['key'] or '(' in kv['key']:
+                parsed = self._parse_hierarchical_key(kv['key'])
+
+                # Spec name이 일치하는지 확인
+                if parsed['spec'] and parsed['spec'] in variants:
+                    # Equipment 매칭도 확인 (있는 경우)
+                    if equipment:
+                        # Equipment가 키의 equipment 부분과 유사한지 확인
+                        if parsed['equipment']:
+                            equip_normalized = parsed['equipment'].upper()
+                            if equipment.upper() in equip_normalized or equip_normalized in equipment.upper():
+                                value = kv['value']
+                                clean_value, unit = self._parse_value_unit(value)
+                                # Unit hint가 있으면 우선 사용
+                                if parsed['unit'] and not unit:
+                                    unit = parsed['unit']
+                                if clean_value and self._is_valid_value(clean_value, spec_upper):
+                                    return (clean_value, unit, f"{kv['key']} | {value}")
+                        # Equipment가 명시되지 않은 경우도 매칭
+                        elif not parsed['equipment']:
+                            value = kv['value']
+                            clean_value, unit = self._parse_value_unit(value)
+                            if parsed['unit'] and not unit:
+                                unit = parsed['unit']
+                            if clean_value and self._is_valid_value(clean_value, spec_upper):
+                                return (clean_value, unit, f"{kv['key']} | {value}")
+                    else:
+                        # Equipment 조건 없음 - spec만 매칭
+                        value = kv['value']
+                        clean_value, unit = self._parse_value_unit(value)
+                        if parsed['unit'] and not unit:
+                            unit = parsed['unit']
+                        if clean_value and self._is_valid_value(clean_value, spec_upper):
+                            return (clean_value, unit, f"{kv['key']} | {value}")
+
         # 1. 정확 매칭 먼저 시도 (번호 prefix 제거 후)
         for kv in self.kv_pairs:
             key_normalized = normalize_key(kv['key'])
@@ -4825,10 +5121,34 @@ class HTMLChunkParser:
                     clean_value, unit = self._parse_value_unit(value)
                     if clean_value and self._is_valid_value(clean_value, spec_upper):
                         return (clean_value, unit, f"{kv['key']} | {value}")
-        
-        # 3. 키-값 쌍에서 유사 매칭
+
+        # 2a. Enhanced fuzzy matching (토큰 기반, 계층적 키 지원)
         best_match = None
         best_score = 0.0
+
+        for kv in self.kv_pairs:
+            # 토큰 기반 fuzzy matching score 계산
+            fuzzy_score = self._compute_fuzzy_match_score(
+                key=kv['key'],
+                spec_name=spec_name,
+                equipment=equipment,
+                expected_unit=""  # Unit은 나중에 파싱에서 확인
+            )
+
+            if fuzzy_score > best_score and fuzzy_score >= 0.6:  # 임계값 0.6
+                value = kv['value']
+                clean_value, unit = self._parse_value_unit(value)
+
+                if clean_value and self._is_valid_value(clean_value, spec_upper):
+                    best_match = (clean_value, unit, f"{kv['key']} | {value}")
+                    best_score = fuzzy_score
+
+        if best_match and best_score >= 0.7:  # 높은 신뢰도면 즉시 반환
+            return best_match
+
+        # 3. 키-값 쌍에서 유사 매칭 (기존 방식, fallback)
+        # best_match는 위에서 이미 선언됨
+        # best_score = 0.0  # 초기화하지 않고 기존 값 유지
         
         for kv in self.kv_pairs:
             key = normalize_key(kv['key'])
@@ -5022,7 +5342,17 @@ class HTMLChunkParser:
         
         raw = raw.strip()
         original_raw = raw  # 원본 보존
-        
+
+        # 0a. 사양명 접두어 제거 (테이블 값에서 중복 사양명 제거)
+        # 예: "SWL 6 tonnes" → "6 tonnes", "MCR 1000 kW" → "1000 kW"
+        # 흔한 사양명 약어: SWL, MCR, NCR, RPM, BHP, SHP 등
+        spec_prefix_pattern = r'^(SWL|MCR|NCR|BHP|SHP|TDH|NPSHr?|FLOW|HEAD|CAPACITY|POWER|VOLTAGE|FREQUENCY|SPEED|PRESSURE|TEMPERATURE|RPM|TH)\s+(\d)'
+        spec_prefix_match = re.match(spec_prefix_pattern, raw, re.I)
+        if spec_prefix_match:
+            # 사양명 제거, 숫자부터 시작하도록
+            prefix_len = len(spec_prefix_match.group(1)) + 1  # +1 for space
+            raw = raw[prefix_len:].strip()
+
         # 0. 텍스트 수량 패턴 우선 처리 (One, Two, Three 등)
         text_qty_match = re.match(
             r'^(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\s*\(\d+\)\s*(sets?|units?|ea|pcs)?',
@@ -5115,7 +5445,7 @@ class HTMLChunkParser:
             (r'([\d.,]+)\s*(Hz)', 2),
             (r'([\d.,]+)\s*(A)\b', 2),
             # 무게
-            (r'([\d.,]+)\s*(kg|ton|t)\b', 2),
+            (r'([\d.,]+)\s*(kg|tonnes?|ton|t)\b', 2),
             # 수량 (단독 숫자만, "x2" 같은 형태 제외)
             (r'^([\d.,]+)\s*(EA|ea|set|sets|pcs|units)', 2),
         ]
@@ -7112,7 +7442,7 @@ class LLMValidator:
         self.logger = logger or logging.getLogger("LLMValidator")
 
     def validate_extraction(self, spec: SpecItem, extracted_value: str, extracted_unit: str,
-                           html_context: str, use_voting: bool = True) -> Dict[str, Any]:
+                           html_context: str, hint: 'ExtractionHint' = None, use_voting: bool = True) -> Dict[str, Any]:
         """
         추출된 값을 LLM으로 검증
 
@@ -7121,6 +7451,7 @@ class LLMValidator:
             extracted_value: 추출된 값
             extracted_unit: 추출된 단위
             html_context: HTML 컨텍스트 (테이블 등)
+            hint: 추출 힌트 (related_units 포함)
             use_voting: Voting 사용 여부
 
         Returns:
@@ -7132,7 +7463,7 @@ class LLMValidator:
                 'reason': str  # 검증 이유
             }
         """
-        prompt = self._build_validation_prompt(spec, extracted_value, extracted_unit, html_context)
+        prompt = self._build_validation_prompt(spec, extracted_value, extracted_unit, html_context, hint)
 
         if use_voting and self.config.vote_enabled:
             response, _, _ = self.llm_client.generate_with_voting(
@@ -7156,8 +7487,13 @@ class LLMValidator:
         return self._parse_validation_response(response, extracted_value, extracted_unit)
 
     def _build_validation_prompt(self, spec: SpecItem, extracted_value: str,
-                                 extracted_unit: str, html_context: str) -> str:
+                                 extracted_unit: str, html_context: str, hint: 'ExtractionHint' = None) -> str:
         """검증 프롬프트 생성"""
+        # Related units 정보 준비
+        related_units_text = "N/A"
+        if hint and hint.related_units:
+            related_units_text = ', '.join(hint.related_units)
+
         prompt = f"""You are a quality assurance specialist in the shipbuilding industry, expert in validating extracted specifications from POS (Purchase Order Specification) documents for marine equipment.
 
 **Context**: Verify that the extracted value is correct and matches the specification in the original document. Ensure data accuracy is critical for ship manufacturing.
@@ -7166,6 +7502,8 @@ class LLMValidator:
 - Name: {spec.spec_name}
 - Equipment: {spec.equipment if spec.equipment else 'N/A'}
 - Expected Unit: {spec.expected_unit if spec.expected_unit else 'N/A'}
+- Related Units (from historical data): {related_units_text}
+  → These units have been used interchangeably in similar specifications and should be treated as equivalent
 
 **Extracted Result to Validate**:
 - Value: {extracted_value}
@@ -7179,8 +7517,10 @@ class LLMValidator:
 **Validation Checklist**:
 1. Does the extracted value EXACTLY exist in the document context?
 2. Does it correspond to the specification name "{spec.spec_name}"?
-3. Is the unit appropriate and matching the document notation?
+3. Is the unit appropriate? Check if it matches expected_unit OR any of the related_units
 4. Is the value format correct (numeric, text, range, etc.)?
+
+**Important**: Units in the "Related Units" list are equivalent (e.g., "ton" and "tonnes", "m3/h" and "m³/h"). Accept any unit from this list.
 
 **Output Format** (JSON only):
 {{
@@ -8500,6 +8840,7 @@ class POSExtractorV61:
                         extracted_value=result.value,
                         extracted_unit=result.unit,
                         html_context=html_context,
+                        hint=hint,  # related_units 포함
                         use_voting=True  # Voting으로 정확도 향상
                     )
 
