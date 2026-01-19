@@ -8745,6 +8745,20 @@ If value not found:
    - Keep exact case, spacing, special characters
    - Example: "capacity" stays "capacity", "CAPACITY" stays "CAPACITY"
 
+10. **EXTRACT ORIGINAL SPEC NAME FROM CHUNK CONTEXT** (CRITICAL):
+    - Do NOT reuse the target spec name "{spec.spec_name}" directly
+    - Find and extract the EXACT text from the chunk that describes this specification
+    - Preserve hierarchical structure: "Working radius | Maximum | 19 m" → original_spec_name: "Working radius | Maximum"
+    - Include contextual parent levels when delimiters (|, :, /) are present
+    - Extract complete descriptive phrase, not just a keyword
+    - Examples:
+      * Chunk: "Hoisting capacity | SWL 6 tonnes" → original_spec_name: "Hoisting capacity"
+      * Chunk: "Working radius | Maximum | 19 m" → original_spec_name: "Working radius | Maximum"
+      * Chunk: "Type: Electro-hydraulic" → original_spec_name: "Type"
+      * Chunk: "The hoisting capacity is rated at 6 tonnes" → original_spec_name: "hoisting capacity"
+    - If the chunk is just a value without context, use the most descriptive text available
+    - The goal is to capture the EXACT specification name as it appears in the POS document, maintaining all original formatting
+
 ## Example
 Document: "Capacity: 700 m³/h, Type: VC"
 Spec: "CAPACITY"
